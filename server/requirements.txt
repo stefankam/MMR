@@ -1,0 +1,9 @@
+flask
+requests
+torch
+transformers
+torchvision
+natsort
+ray
+scikit-learn
+flwr==1.6.0

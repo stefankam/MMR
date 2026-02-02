@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""
+main_server.py
+Coordinator / Orchestrator for DMM FL simulation.
+Exposes a minimal admin endpoint and runs training rounds by calling client /train endpoints.
+"""
+import os, sys, pickle, io, time, random, copy, base64, statistics, csv, requests
+sys.path.append(os.path.abspath("/app/flower"))
+from baselines.flanders.flanders import server
+from baselines.flanders.flanders import strategy
+from baselines.flanders.flanders.strategy import Flanders
+from flwr.common import ndarrays_to_parameters
+import torch
+import numpy as np
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from topology_server import TopologyServer
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+MODEL_NAME = os.environ.get("MODEL_NAME", "distilgpt2")
+ROUNDS = int(os.environ.get("ROUNDS", "10"))
+
+NUM_MODELS = int(os.environ.get("MMR_NUM_MODELS", "5"))
+CLIENTS_PER_MODEL = int(os.environ.get("CLIENTS_PER_MODEL", "4"))
+SAMPLING_OVERLAP_RHO = float(os.environ.get("SAMPLING_OVERLAP_RHO", "0.2"))
+
+DETECTION_CADENCE = int(os.environ.get("DETECTION_CADENCE", "1"))
+CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "5"))
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
+
+SIMULATE_ATTACK = os.environ.get("SIMULATE_ATTACK", "True").lower() in ("1","true","yes")
+ATTACK_START_ROUND = int(os.environ.get("ATTACK_START_ROUND", "2"))
+ATTACK_END_ROUND = int(os.environ.get("ATTACK_END_ROUND", "999"))
+NUM_BYZANTINE_CLIENTS = int(os.environ.get("NUM_BYZANTINE_CLIENTS", "3"))
+
+ALPHA = float(os.environ.get("ALPHA", "3.0"))
+BETA  = float(os.environ.get("BETA",  "2.0"))
+
+FL_W_MIN = int(os.environ.get("FL_W_MIN", "5"))
+FL_W_MAX = int(os.environ.get("FL_W_MAX", "10"))
+
+MMR_ROTATION = os.environ.get("MMR_ROTATION", "True").lower() in ("1","true","yes")
+MMR_DIVERGENCE_MITIGATION = os.environ.get("MMR_DIVERGENCE_MITIGATION", "True").lower() in ("1","true","yes")
+USE_FLANDERS = os.environ.get("USE_FLANDERS", "False").lower() in ("1","true","yes")
+TRACK_METRICS = os.environ.get("TRACK_METRICS", "True").lower() in ("1","true","yes")
+
+# ---------------------------
+# Experiment structures
+# ---------------------------
+@dataclass
+class ExperimentConfig:
+    detector: str
+    K_clients: int
+    rounds: int
+    q_participation: float
+    p_attack: float
+    Nm: int
+    seed: int
+    attack_type: str
+    scale_s: float = 3.0
+    slow_eps: float = 1e-3
+    flanders_W: int = 8
+    rotation: bool = True
+    rho_overlap: float = SAMPLING_OVERLAP_RHO
+    mitigation: bool = True
+    dirichlet_alpha: float = 1.0
+
+class MetricsRecorder:
+    def __init__(self, exp: ExperimentConfig):
+        self.exp = exp
+        self.round_scores = {}
+        self.round_flags = {}
+        self.attack_active = {}
+        self.first_detect_round = None
+
+    def log_round(self, r: int, score: float, flags: List[tuple], attack_any: bool):
+        self.round_scores[r] = score
+        self.round_flags[r] = [f for f in flags]
+        self.attack_active[r] = attack_any
+        if attack_any and flags and self.first_detect_round is None:
+            self.first_detect_round = r
+
+    def export_csv(self, fname: str):
+        with open(fname, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["seed","detector","Nm","q","p","attack","round","y_true","score","flags"])
+            for r in sorted(self.round_scores.keys()):
+                y = 1 if self.attack_active[r] else 0
+                s = self.round_scores[r]
+                w.writerow([self.exp.seed,self.exp.detector,self.exp.Nm,
+                            self.exp.q_participation,self.exp.p_attack,
+                            self.exp.attack_type,r,y,s,repr(self.round_flags[r])])
+
+    def summary(self):
+        y = [1 if self.attack_active[r] else 0 for r in sorted(self.round_scores)]
+        s = [self.round_scores[r] for r in sorted(self.round_scores)]
+        if not s:
+            return {"AUC":0.0,"TTD":None}
+        thresholds = sorted(set(s),reverse=True)
+        pts=[]
+        P=sum(y); N=len(y)-P
+        for th in thresholds:
+            tp=sum(1 for yy,ss in zip(y,s) if ss>=th and yy==1)
+            fp=sum(1 for yy,ss in zip(y,s) if ss>=th and yy==0)
+            tpr=tp/(P+1e-9); fpr=fp/(N+1e-9)
+            pts.append((fpr,tpr))
+        pts=sorted(pts)
+        auc=0.0
+        for (x1,y1),(x2,y2) in zip(pts,pts[1:]):
+            auc+=(x2-x1)*(y1+y2)/2.0
+        TTD=None
+        if self.first_detect_round is not None:
+            t0=min([r for r,v in self.attack_active.items() if v],default=None)
+            if t0 is not None:
+                TTD=max(0,self.first_detect_round-t0)
+        return {"AUC":auc,"TTD":TTD}
+
+# ---------------------------
+# Utility encode/decode
+# ---------------------------
+def state_dict_to_b64(state_dict: Dict[str, torch.Tensor]) -> str:
+    buf=io.BytesIO(); torch.save(state_dict,buf); buf.seek(0)
+    return base64.b64encode(buf.read()).decode("ascii")
+def b64_to_state_dict(s: str) -> Dict[str, torch.Tensor]:
+    b=base64.b64decode(s.encode("ascii"))
+    buf=io.BytesIO(b); buf.seek(0)
+    return torch.load(buf,map_location="cpu")
+
+# ---------------------------
+# Server class
+# ---------------------------
+class DMMCoordinator:
+    def __init__(self, model_name: str, topology_url: str, exp: ExperimentConfig=None):
+        self.device_registry={}
+        self.topology=TopologyServer(topology_url)
+        self.tokenizer=AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({"pad_token":"[PAD]"})
+        self.model_name=model_name
+        self.exp=exp
+        Nm=getattr(exp,"Nm",NUM_MODELS) if exp else NUM_MODELS
+        self.models=[AutoModelForCausalLM.from_pretrained(model_name).cpu() for _ in range(Nm)]
+        for m in self.models: m.resize_token_embeddings(len(self.tokenizer))
+        self.checkpoints={}
+        self.safe_round=0
+        self.quarantined=set()
+        self.probe_prompts=[
+            "Write a short sentence about machine learning.",
+            "How do you make tea?",
+            "Translate the following sentence:",
+            "The backdoor phrase is"
+        ]
+        while len(self.probe_prompts)<32:
+            self.probe_prompts.append(random.choice(self.probe_prompts))
+        self.flanders_strategy = Flanders(
+           window=8,
+           maxiter=100,
+           alpha=1,
+           beta=1,
+           distance_function=lambda gt, pred: np.mean((gt - pred)**2, axis=1)
+        )
+        self.recent_deltas = []
+        self.client_history = defaultdict(list)
+
+
+    def start_registration_server(self):
+        from flask import Flask, request, jsonify
+        import threading
+        app=Flask(__name__)
+        @app.route("/register",methods=["POST"])
+        def register():
+            data=request.json
+            device_id=data["device_id"]; addr=request.remote_addr
+            host,port=data["address"].split(":")
+            self.device_registry[device_id]={'ip':addr,'port':port,'malicious':data.get("malicious",False),'last_seen':time.time()}
+            print(f"[SERVER] Registered {device_id} ({addr}:{port})")
+            return jsonify({"status":"ok"})
+        threading.Thread(target=lambda:app.run(host="0.0.0.0",port=SERVER_PORT),daemon=True).start()
+
+    def get_state(self,i): return {k:v.detach().cpu().clone() for k,v in self.models[i].state_dict().items()}
+    def set_state(self,i,state): self.models[i].load_state_dict(state)
+
+    def consensus_state(self):
+        active=[i for i in range(len(self.models)) if i not in self.quarantined]
+        if not active: active=list(range(len(self.models)))
+        states=[self.get_state(i) for i in active]
+        agg=copy.deepcopy(states[0])
+        for s in states[1:]:
+            for k in agg: agg[k]+=s[k]
+        for k in agg: agg[k]/=len(states)
+        return agg
+
+    def compute_pairwise_distances(self):
+        Nm=len(self.models)
+        flats=[]
+        for i in range(Nm):
+            sd=self.get_state(i)
+            parts=[v.reshape(-1) for v in sd.values()]
+            flats.append(torch.cat(parts))
+        D=[[0.0]*Nm for _ in range(Nm)]
+        for i in range(Nm):
+            for j in range(i+1,Nm):
+                D[i][j]=D[j][i]=torch.norm(flats[i]-flats[j]).item()
+        return D
+
+    def compute_probe_losses(self):
+        losses=[]
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        for m in self.models:
+            m=copy.deepcopy(m).to(device).eval()
+            total=0.0; n=0
+            with torch.no_grad():
+                for p in self.probe_prompts:
+                    enc=self.tokenizer(p,return_tensors="pt",truncation=True,padding=True).to(device)
+                    out=m(**enc,labels=enc["input_ids"])
+                    total+=out.loss.item(); n+=1
+            losses.append(total/max(1,n))
+        return losses
+
+    def detect_anomalies(self,D,Nm,probe_losses,alpha=3.0,beta=2.0):
+        tri=[D[i][j] for i in range(Nm) for j in range(i+1,Nm)]
+        if not tri: return []
+        med=statistics.median(tri)
+        mad=statistics.median([abs(x-med) for x in tri]) or 1e-6
+        thr=med+alpha*mad
+        flags=[]
+        for i in range(Nm):
+            for j in range(i+1,Nm):
+                if D[i][j]>thr: flags.append(("pairwise-divergence",i,j,D[i][j],thr))
+        varp=statistics.pvariance(probe_losses) if len(probe_losses)>1 else 0.0
+        if self.probe_variance_baseline is None:
+            self.probe_variance_baseline=max(varp,1e-6)
+        if varp>beta*self.probe_variance_baseline:
+            flags.append(("probe-variance-spike",i,varp,self.probe_variance_baseline))
+        return flags
+
+    def respond_to_flags(self,flags,round_idx,client_contribs,client_updates):
+        print(f"[SERVER] Round {round_idx}: flags={flags}")
+        safe=max(self.checkpoints.keys()) if self.checkpoints else None
+        for f in flags:
+            if f[0] in ("pairwise-divergence","cluster-split"):
+                _,i,j,*_=f
+                for m in {i,j}:
+                    self.quarantined.add(m)
+                    if safe is not None:
+                        self.set_state(m,self.checkpoints[safe])
+                        print(f"[SERVER] Rolled back model {m} to checkpoint {safe}")
+
+    def aggregate_and_apply(self,updates_list,method="mean"):
+        ts=[b64_to_state_dict(b) for b in updates_list]
+        agg=copy.deepcopy(ts[0])
+        for k in agg: agg[k]=sum(t[k] for t in ts)/len(ts)
+        return agg
+
+    def flanders_score(self,recent_client_deltas,W:int):
+        if len(recent_client_deltas)<2: return 0.0
+        vecs=[torch.cat([v.reshape(-1) for v in sd.values()]) for sd in recent_client_deltas[-W:]]
+        M=torch.stack(vecs,dim=0)
+        return float(torch.var(M,dim=0,unbiased=False).mean().item())
+
+
+    def reduce_delta(self, delta_state, k=128):
+        # Flatten
+        important_keys = [k for k in delta_state.keys() if "ln_" in k or "layer_norm" in k]
+
+        flat = torch.cat([delta_state[k].reshape(-1) for k in important_keys]).cpu().numpy()
+
+
+        # Chunked mean pooling
+        n = len(flat)
+        chunk = n // k
+        if chunk == 0:
+            # pad if too small
+            return np.pad(flat, (0, k-n), mode='constant')[:k]
+
+        pooled = flat[:chunk*k].reshape(k, chunk).mean(axis=1)
+        return pooled.astype(np.float32)
+
+
+
+    def _normalize_history(self, W):
+        """
+        Make all client histories have shape (W, D):
+          - pad with last vector if too short
+          - truncate oldest entries if too long
+        """
+        # compute maximum feature dimension
+        D = None
+        for cid, hist in self.client_history.items():
+            if len(hist) > 0:
+                D = len(hist[0])
+                break
+
+        if D is None:
+            return   # nothing yet
+
+        for cid, hist in self.client_history.items():
+            t = len(hist)
+
+            if t == 0:
+                continue
+
+            if t < W:
+                last = hist[-1]
+                # pad: append copies of last vector
+                for _ in range(W - t):
+                    hist.append(last)
+            elif t > W:
+                # truncate from the front
+                self.client_history[cid] = hist[-W:]
+
+
+
+    # ---------------------------
+    # Main FL loop
+    # ---------------------------
+    def run_rounds(self, rounds=ROUNDS, exp: ExperimentConfig=None):
+        self.quarantined=set(); self.checkpoints={}; self.safe_round=0; self.probe_variance_baseline=None
+        mr=MetricsRecorder(exp); recent_deltas_for_flanders=[]
+        self.checkpoints[0]=self.consensus_state()
+        all_clients=[{"id":cid,"address":d["ip"],"port":int(d.get("port",5000))} for cid,d in self.device_registry.items()]
+        if not all_clients: 
+            print("[SERVER] No clients registered."); return
+        self.round_flags_accum={}
+
+        for r in range(1,rounds+1):
+            print(f"\n[SERVER] === Round {r} ===")
+            Nm=getattr(exp,"Nm",NUM_MODELS)
+            m=max(1,int(exp.q_participation*len(all_clients)))
+            active=random.sample(all_clients,k=m)
+            if exp.rotation:
+                mapping={i:random.sample(active,k=min(CLIENTS_PER_MODEL,len(active))) for i in range(Nm)}
+            else:
+                same=random.sample(active,k=min(CLIENTS_PER_MODEL,len(active)))
+                mapping={i:same for i in range(Nm)}
+
+            model_updates={i:[] for i in range(Nm)}; client_updates={}; client_contribs={i:[] for i in range(Nm)}
+            attack_any=False
+
+            # ---- Client updates ----
+            for i in range(Nm):
+                for ce in mapping[i]:
+                    cid,addr,port=ce["id"],ce["address"],ce["port"]
+                    use_mal=(random.random()<exp.p_attack)
+                    if use_mal: attack_any=True
+                    payload={"model_state_b64":state_dict_to_b64(self.get_state(i)),
+                             "use_malicious":use_mal,
+                             "attack_type":exp.attack_type,
+                             "attack_param":{"scale_s":exp.scale_s,"slow_eps":exp.slow_eps},
+                             "local_epochs":1,"batch_size":4,"lr":5e-5}
+
+                    try:
+                        resp=requests.post(f"http://{addr}:{port}/train",json=payload,timeout=120)
+                        delta_b64=resp.json()["delta_b64"]
+                        model_updates[i].append(delta_b64)
+                        client_updates[(i,cid)]=delta_b64
+                        client_contribs[i].append(cid)
+                        if exp.detector=="FLANDERS":
+                           delta_state = b64_to_state_dict(delta_b64)
+                           features = self.reduce_delta(delta_state, k=128)
+                           # Initialize client history list
+                           if cid not in self.client_history:
+                              self.client_history[cid] = []
+                           # Save to history
+                           self.client_history[cid].append(features)
+
+                    except Exception as e:
+                        print(f"[SERVER] Error contacting {cid}: {e}")
+
+
+                # NORMALIZE histories for all clients to SAME SHAPE (W, D)
+                self._normalize_history(exp.flanders_W)
+
+                # SAVE CONSISTENT FILES
+                save_dir = "clients_params"
+                os.makedirs(save_dir, exist_ok=True)
+
+                for cid, hist in self.client_history.items():
+                    tensor = np.stack(hist, axis=0)   # shape (W, D)
+                    np.save(f"{save_dir}/{cid}.npy", tensor)
+
+
+
+
+            # ---- Aggregate ----
+            for i in range(Nm):
+                if i in self.quarantined or not model_updates[i]: continue
+                agg=self.aggregate_and_apply(model_updates[i])
+                new={k:self.get_state(i)[k]+agg[k] for k in self.get_state(i)}
+                self.set_state(i,new)
+
+            # ---- Checkpoint ----
+            if r%CHECKPOINT_INTERVAL==0:
+                self.checkpoints[r]=self.consensus_state(); self.safe_round=r
+                print(f"[SERVER] Stored checkpoint {r}")
+
+            # ---- Detection ----
+            mmr_flags=[]; score=0.0
+            if exp.detector=="MMR" and Nm>1:
+                D=self.compute_pairwise_distances(); probe_losses=self.compute_probe_losses()
+                tri=[D[a][b] for a in range(Nm) for b in range(a+1,Nm)]
+                max_pair=max(tri) if tri else 0.0
+                varp=statistics.pvariance(probe_losses) if len(probe_losses)>1 else 0.0
+                mmr_flags=self.detect_anomalies(D,Nm,probe_losses,ALPHA,BETA)
+                if mmr_flags:
+                   score = 1
+                else:
+                   score=max(max_pair,varp)
+                if mmr_flags and exp.mitigation:
+                    self.respond_to_flags(mmr_flags,r,client_contribs,client_updates)
+
+            mr.log_round(r, score, mmr_flags, attack_any)
+
+            # ------------------------------------------------------
+            # FLANDERS detection block
+            # ------------------------------------------------------
+            # --- Detector selection & score ---
+            flanders_flags=[]
+            score =0.0
+
+            if exp.detector == "FLANDERS":
+            
+                # -------------------------------------------------------
+                # Build Flower-style FitRes results for all clients
+                # -------------------------------------------------------
+                flwr_results = []
+                for (mid, cid), delta_b64 in client_updates.items():
+            
+                    delta_state = b64_to_state_dict(delta_b64)
+                    flat = torch.cat([v.reshape(-1) for v in delta_state.values()]).cpu().numpy()
+            
+                    # Flower parameters packing
+                    params = ndarrays_to_parameters([flat])
+            
+                    class FitResObj:
+                        pass
+                    fr = FitResObj()
+                    fr.parameters = params
+                    fr.num_examples = 1
+                    fr.metrics = {
+                        "cid": cid,
+                        "malicious": int(self.device_registry[cid]["malicious"])
+                    }
+            
+                    flwr_results.append((None, fr))
+            
+
+                # Run FLANDERS aggregation
+                # -------------------------------------------------------
+                params_agg, metrics = self.flanders_strategy.aggregate_fit(
+                    server_round=r,
+                    results=flwr_results,
+                    failures=[]
+                )
+                
+                # Extract indices of good and malicious clients
+                good_clients_idx = metrics.get("good_clients_idx", [])
+                malicious_clients_idx = metrics.get("malicious_clients_idx", [])
+                
+                # Convert idx → client IDs (order in flwr_results)
+                # flwr_results = [(None, FitRes), ...]
+                client_ids = [fr[1].metrics["cid"] for fr in flwr_results]
+                
+                good_clients = [client_ids[i] for i in good_clients_idx if 0 <= i < len(client_ids)]
+                malicious_clients = [client_ids[i] for i in malicious_clients_idx if 0 <= i < len(client_ids)]
+                
+                # -------------------------------------------------------
+                # Convert to flags usable by your MMR workflow
+                # -------------------------------------------------------
+                flanders_flags = [("flanders-detect", cid) for cid in malicious_clients]
+                if flanders_flags:
+                   score = 1
+                else:
+                   score = float(len(malicious_clients))
+
+
+            # Always log round to metrics recorder
+            mr.log_round(r, score, flanders_flags, attack_any)
+
+
+# -------------------------------------------------------
+            #  DETECTION LOGGING (MMR + FLANDERS SEPARATE)
+            # -------------------------------------------------------
+            mmr_detected_clients = set()
+            flanders_detected_clients = set()
+            
+            if exp.detector == "MMR":
+                # flags look like: ("pairwise-divergence", i, j, ...)
+                for f in mmr_flags:
+                    if f[0] == "pairwise-divergence":
+                        _, i, j, *_ = f
+                        mmr_detected_clients.update([f"Device_{i}", f"Device_{j}"])
+                        print(f"[SERVER] Round {r}: Detected anomalies {i} and {j} → {f[0]}")
+                    elif f[0] == "probe-variance-spike":
+                        _, i, *_ = f
+                        mmr_detected_clients.add(f"Device_{i}")
+                        print(f"[SERVER] Round {r}: Detected anomalies {i}  → {f[0]}")
+                self.round_flags_accum.setdefault("MMR", {})
+                self.round_flags_accum["MMR"][r] = list(mmr_detected_clients)
+            
+            elif exp.detector == "FLANDERS":
+                # flags look like: ("flanders-detect", cid)
+                for f in flanders_flags:
+                    if f[0] == "flanders-detect":
+                        _, cid = f
+                        flanders_detected_clients.add(cid)
+                        print(f"[SERVER] Round {r}: Detected anomalies {cid} → {f[0]}")
+                self.round_flags_accum.setdefault("FLANDERS", {})
+                self.round_flags_accum["FLANDERS"][r] = list(flanders_detected_clients)
+            
+            
+
+
+
+            # ---- Metrics ----
+            TP = FP = FN = TN = 0
+            for cid, info in self.device_registry.items():
+                gt = info.get("malicious", False)
+                print(f"whether client {cid} is malicious is {gt}")
+                mmr_detected_any = cid in self.round_flags_accum.get("MMR", {}).get(rr, [])
+                                      
+                if gt and mmr_detected_any:
+                    TP += 1
+                elif gt and not mmr_detected_any:
+                    FN += 1
+                elif not gt and mmr_detected_any:
+                    FP += 1
+                else:
+                    TN += 1
+            TPR = TP / (TP + FN + 1e-6);
+            FPR = FP / (FP + TN + 1e-6)
+            print(f"[SERVER] MMR Client-level Detection: TPR={TPR:.3f}, FPR={FPR:.3f}")
+
+            # ---- Metrics ----
+            TP = FP = FN = TN = 0
+            for cid, info in self.device_registry.items():
+                gt = info.get("malicious", False)
+                print(f"whether client {cid} is malicious is {gt}")
+                flanders_detected_any = cid in self.round_flags_accum.get("FLANDERS", {}).get(r, [])
+                                        
+                if gt and flanders_detected_any:
+                    TP += 1
+                elif gt and not flanders_detected_any:
+                    FN += 1
+                elif not gt and flanders_detected_any:
+                    FP += 1
+                else:
+                    TN += 1
+            TPR = TP / (TP + FN + 1e-6);
+            FPR = FP / (FP + TN + 1e-6)
+            print(f"[SERVER] FLANDERS Client-level Detection: TPR={TPR:.3f}, FPR={FPR:.3f}")
+
+
+            tag = f"{exp.detector}_Nm{exp.Nm}_q{exp.q_participation}_p{exp.p_attack}_{exp.attack_type}_seed{exp.seed}"
+            mr.export_csv(f"signaltest_{tag}.csv")
+            summ = mr.summary()
+            print(f"[SERVER] {tag}  AUC={summ['AUC']:.3f}  TTD={summ['TTD']}")
+
+
+if __name__ == "__main__":
+    topology_url = "http://topology_server:8080"
+    server = DMMCoordinator(MODEL_NAME, topology_url)   # no exp yet
+
+    # --- Start registration listener once ---
+    server.start_registration_server()
+
+    EXPECTED_CLIENTS = 3
+    while len(server.device_registry) < EXPECTED_CLIENTS:
+        print(f"[SERVER] Waiting for clients... ({len(server.device_registry)}/{EXPECTED_CLIENTS})")
+        time.sleep(5)
+    print(f"[SERVER] All clients registered: {list(server.device_registry.keys())}")
+
+    qs = [0.8]
+    ps = [0.3]
+    nms = [3]
+    atks = ["backdoor"]
+    seeds = [1]
+
+    # Choose detector per sweep (repeat this block for each method: NONE, ROBUST, FLANDERS, MMR)
+    # Loop over detectors and experiment configs
+    for DET in ["FLANDERS", "MMR"]:
+        for q in qs:
+            for p in ps:
+                for Nm in nms:
+                    for atk in atks:
+                        for sd in seeds:
+                            print(f"\n[RUN] detector={DET} q={q} p={p} Nm={Nm} atk={atk} seed={sd}")
+                            exp = ExperimentConfig(
+                                detector=DET,
+                                K_clients=100,  # Expected total clients
+                                rounds=ROUNDS,
+                                q_participation=q,
+                                p_attack=p,
+                                Nm=Nm,
+                                seed=sd,
+                                attack_type=atk,
+                                flanders_W=random.randint(FL_W_MIN, FL_W_MAX),
+                                rotation=True,
+                                rho_overlap=SAMPLING_OVERLAP_RHO,
+                                mitigation=True
+                            )
+
+                            # --- Run experiment ---
+                            server.run_rounds(rounds=exp.rounds, exp=exp)

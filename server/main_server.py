@@ -104,18 +104,76 @@ class ExperimentConfig:
 
 # Per-round metrics recorder
 class MetricsRecorder:
-    def __init__(self, exp: ExperimentConfig):
+    def __init__(self, exp: ExperimentConfig, csv_path: str):
         self.exp = exp
+        self.csv_path = csv_path
         self.rows = []   # one row per round
         self.round_flags: Dict[int, list] = {}
         self.round_scores: Dict[int, float] = {}  # detector score per round
         self.attack_active: Dict[int, bool] = {}  # ground truth (any attacker selected this round)
         self.first_detect_round = None            # for TTD
+        self._ensure_csv_header()
 
-    def log_round(self, r: int, score: float, flags: List[tuple], attack_any: bool):
+    def _ensure_csv_header(self):
+        # Create file once and keep appending rows round-by-round for all experiment sweeps.
+        if not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0:
+            with open(self.csv_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "seed","detector","Nm","q","p","attack","round","y_true","score","flags",
+                    "cpu_threads","cpu_allowed_list","cpu_voluntary_ctxt_switches","cpu_nonvoluntary_ctxt_switches",
+                    "mem_vm_size","mem_vm_rss","mem_vm_hwm","mem_vm_swap",
+                    "disk_rss_file","disk_rss_shmem",
+                    "overhead_round_total_sec","overhead_detection_sec",
+                ])
+
+    def _append_round_row(self, r: int, resource_usage: Dict[str, Dict[str, str]], overhead: Dict[str, float]):
+        y = 1 if self.attack_active[r] else 0
+        s = self.round_scores[r]
+        fl = self.round_flags[r]
+        cpu = resource_usage.get("cpu", {})
+        mem = resource_usage.get("memory", {})
+        disk = resource_usage.get("disk", {})
+        with open(self.csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                self.exp.seed,
+                self.exp.detector,
+                self.exp.Nm,
+                self.exp.q_participation,
+                self.exp.p_attack,
+                self.exp.attack_type,
+                r,
+                y,
+                s,
+                repr(fl),
+                cpu.get("threads", "unknown"),
+                cpu.get("cpus_allowed_list", "unknown"),
+                cpu.get("voluntary_ctxt_switches", "unknown"),
+                cpu.get("nonvoluntary_ctxt_switches", "unknown"),
+                mem.get("vm_size", "unknown"),
+                mem.get("vm_rss", "unknown"),
+                mem.get("vm_hwm", "unknown"),
+                mem.get("vm_swap", "unknown"),
+                disk.get("rss_file", "unknown"),
+                disk.get("rss_shmem", "unknown"),
+                overhead.get("round_total_sec", 0.0),
+                overhead.get("detection_sec", 0.0),
+            ])
+
+    def log_round(
+        self,
+        r: int,
+        score: float,
+        flags: List[tuple],
+        attack_any: bool,
+        resource_usage: Dict[str, Dict[str, str]],
+        overhead: Dict[str, float],
+    ):
         self.round_scores[r] = score
         self.round_flags[r] = flags
         self.attack_active[r] = attack_any
+        self._append_round_row(r, resource_usage, overhead)
         if attack_any and flags and self.first_detect_round is None:
             self.first_detect_round = r
 
@@ -123,13 +181,23 @@ class MetricsRecorder:
         # ROC/AUC wants (y_true,y_score) per round; we also dump flags
         with open(fname, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["seed","detector","Nm","q","p","attack","round","y_true","score","flags"])
+            w.writerow([
+                "seed","detector","Nm","q","p","attack","round","y_true","score","flags",
+                "cpu_threads","cpu_allowed_list","cpu_voluntary_ctxt_switches","cpu_nonvoluntary_ctxt_switches",
+                "mem_vm_size","mem_vm_rss","mem_vm_hwm","mem_vm_swap",
+                "disk_rss_file","disk_rss_shmem",
+                "overhead_round_total_sec","overhead_detection_sec",
+            ])
             for r in sorted(self.round_scores.keys()):
                 y = 1 if self.attack_active[r] else 0
                 s = self.round_scores[r]
                 fl = self.round_flags[r]
                 w.writerow([self.exp.seed, self.exp.detector, self.exp.Nm, self.exp.q_participation,
-                            self.exp.p_attack, self.exp.attack_type, r, y, s, repr(fl)])
+                            self.exp.p_attack, self.exp.attack_type, r, y, s, repr(fl),
+                            "unknown","unknown","unknown","unknown",
+                            "unknown","unknown","unknown","unknown",
+                            "unknown","unknown",0.0,0.0])
+
 
     def summary(self) -> Dict[str, any]:
         # simple AUC (ROC) via rank/trapezoid approximation on discrete thresholds
@@ -163,8 +231,6 @@ class MetricsRecorder:
 
 
 
-
-
 # Simple utility: encode / decode state_dict to base64 str
 def state_dict_to_b64(state_dict: Dict[str, torch.Tensor]) -> str:
     buffer = io.BytesIO()
@@ -178,6 +244,45 @@ def b64_to_state_dict(s: str) -> Dict[str, torch.Tensor]:
     buffer = io.BytesIO(b)
     buffer.seek(0)
     return torch.load(buffer, map_location="cpu")
+
+
+def _read_proc_status() -> Dict[str, str]:
+    """Read /proc/self/status into a key/value map."""
+    out: Dict[str, str] = {}
+    with open("/proc/self/status", "r", encoding="utf-8") as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def get_resource_usage() -> Dict[str, Dict[str, str]]:
+    """
+    Resource telemetry derived from /proc/self/status.
+    CPU is represented by scheduler/context-switch indicators in status.
+    """
+    status = _read_proc_status()
+    return {
+        "cpu": {
+            "threads": status.get("Threads", "unknown"),
+            "cpus_allowed_list": status.get("Cpus_allowed_list", "unknown"),
+            "voluntary_ctxt_switches": status.get("voluntary_ctxt_switches", "unknown"),
+            "nonvoluntary_ctxt_switches": status.get("nonvoluntary_ctxt_switches", "unknown"),
+        },
+        "memory": {
+            "vm_size": status.get("VmSize", "unknown"),
+            "vm_rss": status.get("VmRSS", "unknown"),
+            "vm_hwm": status.get("VmHWM", "unknown"),
+            "vm_swap": status.get("VmSwap", "unknown"),
+        },
+        "disk": {
+            "rss_file": status.get("RssFile", "unknown"),
+            "rss_shmem": status.get("RssShmem", "unknown"),
+        },
+    }
+
 
 # ---------------------------
 # Server class
@@ -232,6 +337,12 @@ class DMMCoordinator:
            self.device_registry[device_id] = {'ip': addr, 'port': port, 'malicious': is_malicious, 'last_seen': time.time()}
            print(f"[SERVER] Registered client: {device_id} ({addr}:{port})")
            return jsonify({"status": "ok"})
+
+
+        @app.route("/resource_usage", methods=["GET"])
+        def resource_usage_endpoint():
+            return jsonify(get_resource_usage())
+
 
         # Run Flask in background
         threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000), daemon=True).start()
@@ -408,14 +519,13 @@ class DMMCoordinator:
         print(f"[SERVER] Initialized {self.exp.Nm} models for detector={self.exp.detector}")
 
 
-
-    def run_rounds(self, rounds=ROUNDS, exp: ExperimentConfig=None):
+    def run_rounds(self, rounds=ROUNDS, exp: ExperimentConfig=None, csv_path: str = "signaltest_all_runs.csv"):
        # initial checkpoint
        self.checkpoints[0] = self.consensus_state()
        self.safe_round = 0
 
        # ✅ ADD THIS HERE
-       mr = MetricsRecorder(exp)
+       mr = MetricsRecorder(exp, csv_path)
 
        # build all registered clients
        all_clients = [
@@ -444,7 +554,10 @@ class DMMCoordinator:
             mapping = {i: same for i in range(Nm)}
 
        for r in range(1, rounds+1):
+        round_start = time.perf_counter()
         print(f"\n[SERVER] === Round {r} ===")  
+        round_resource_usage = get_resource_usage()
+        print(f"[SERVER] Resource usage: {round_resource_usage}")
         model_updates = {i: [] for i in range(Nm)}
         client_updates = {}
         client_contribs = {i: [] for i in range(Nm)}
@@ -516,6 +629,7 @@ class DMMCoordinator:
                 print(f"[SERVER] Stored safe checkpoint at round {r}")
             
             # --- Detector selection & score ---
+            detection_start = time.perf_counter()
             flags = []
             score = 0.0
             
@@ -628,16 +742,23 @@ class DMMCoordinator:
 
 
             # log metrics
-            mr.log_round(r, score, flags, attack_any)
+            detection_elapsed = time.perf_counter() - detection_start
+            round_total_elapsed = time.perf_counter() - round_start
+            mr.log_round(
+                r,
+                score,
+                flags,
+                attack_any,
+                round_resource_usage,
+                {"round_total_sec": round_total_elapsed, "detection_sec": detection_elapsed},
+            )
 
 
         print("[SERVER] Training rounds complete.")
-        # Export round-wise scores for ROC/AUC/TTD
+        # Metrics are already appended per-round to the combined csv_path.
         tag = f"{exp.detector}_Nm{exp.Nm}_q{exp.q_participation}_p{exp.p_attack}_{exp.attack_type}_seed{exp.seed}"
-        mr.export_csv(f"signaltest_{tag}.csv")
         summ = mr.summary()
-        print(f"[SERVER] {tag}  AUC={summ['AUC']:.3f}  TTD={summ['TTD']}")
-
+        print(f"[SERVER] {tag}  AUC={summ['AUC']:.3f}  TTD={summ['TTD']}  csv={csv_path}")
 
 
 
@@ -662,6 +783,11 @@ if __name__ == "__main__":
 
     # Choose detector per sweep (repeat this block for each method: NONE, ROBUST, FLANDERS, MMR)
     # Loop over detectors and experiment configs
+    all_results_csv = "signaltest_all_runs.csv"
+    if os.path.exists(all_results_csv):
+        os.remove(all_results_csv)
+
+
     for DET in ["MMR", "ROBUST", "FLANDERS", "NONE"]:
         for q in qs:
             for p in ps:
@@ -685,4 +811,4 @@ if __name__ == "__main__":
                             )
 
                             # --- Run experiment ---
-                            server.run_rounds(rounds=exp.rounds, exp=exp)
+                            server.run_rounds(rounds=exp.rounds, exp=exp, csv_path=all_results_csv)

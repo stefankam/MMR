@@ -71,6 +71,45 @@ def b64_to_state_dict(s):
     return torch.load(bio, map_location="cpu")
 
 
+def _read_proc_status() -> Dict[str, str]:
+    """Read /proc/self/status into a key/value map."""
+    out: Dict[str, str] = {}
+    with open("/proc/self/status", "r", encoding="utf-8") as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def get_resource_usage() -> Dict[str, Dict[str, str]]:
+    """
+    Resource telemetry derived from /proc/self/status.
+    CPU is approximated via scheduler/context-switch indicators exposed in status.
+    """
+    status = _read_proc_status()
+    return {
+        "cpu": {
+            "threads": status.get("Threads", "unknown"),
+            "cpus_allowed_list": status.get("Cpus_allowed_list", "unknown"),
+            "voluntary_ctxt_switches": status.get("voluntary_ctxt_switches", "unknown"),
+            "nonvoluntary_ctxt_switches": status.get("nonvoluntary_ctxt_switches", "unknown"),
+        },
+        "memory": {
+            "vm_size": status.get("VmSize", "unknown"),
+            "vm_rss": status.get("VmRSS", "unknown"),
+            "vm_hwm": status.get("VmHWM", "unknown"),
+            "vm_swap": status.get("VmSwap", "unknown"),
+        },
+        "disk": {
+            "rss_file": status.get("RssFile", "unknown"),
+            "rss_shmem": status.get("RssShmem", "unknown"),
+        },
+    }
+
+
+
 def apply_attack_to_delta(delta: Dict[str, torch.Tensor], attack_type: str, params: Dict[str, float]) -> Dict[str, torch.Tensor]:
     # Non-destructive clone
     out = {k: v.clone() for k, v in delta.items()}
@@ -167,7 +206,12 @@ def train_endpoint():
        delta = apply_attack_to_delta(delta, attack_type, attack_param)
     # encode and return
     delta_b64 = state_dict_to_b64(delta)
-    return jsonify({"delta_b64": delta_b64})
+    usage = get_resource_usage()
+    return jsonify({"delta_b64": delta_b64, "resource_usage": usage})
+
+@app.route("/resource_usage", methods=["GET"])
+def resource_usage_endpoint():
+    return jsonify(get_resource_usage())
 
 
 

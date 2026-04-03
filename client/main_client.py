@@ -34,6 +34,8 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "distilgpt2")
 TOPOLOGY_URL = os.environ.get("TOPOLOGY_URL", "http://topology_server:8080")
 CLIENT_PORT = int(os.environ.get("CLIENT_PORT", "5000"))
 CLIENT_HOST = os.environ.get("CLIENT_HOST", "0.0.0.0")
+LOCAL_NUM_PROMPTS = int(os.environ.get("LOCAL_NUM_PROMPTS", "16"))
+LOCAL_MAX_STEPS = int(os.environ.get("LOCAL_MAX_STEPS", "24"))
 
 # Local client state
 client_id = None
@@ -42,7 +44,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 # prepare local datasets (benign always available)
-local_benign = build_benign_prompts(num_per_client=40)
+local_benign = build_benign_prompts(num_per_client=LOCAL_NUM_PROMPTS)
 # some clients may have malicious data available
 has_malicious_data = random.random() < 1.0
 if has_malicious_data:
@@ -188,6 +190,7 @@ def train_endpoint():
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     optimizer = AdamW(model.parameters(), lr=lr)
+    step_count = 0
     for epoch in range(local_epochs):
         for batch in loader:
             optimizer.zero_grad()
@@ -196,6 +199,11 @@ def train_endpoint():
             loss = outputs.loss
             loss.backward()
             optimizer.step()
+            step_count += 1
+            if step_count >= LOCAL_MAX_STEPS:
+                break
+        if step_count >= LOCAL_MAX_STEPS:
+            break
 
     # compute delta: new_state - old_state
     new_state = {k: v.detach().cpu().clone() for k,v in model.state_dict().items()}

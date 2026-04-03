@@ -11,7 +11,7 @@ import random
 import csv
 import time
 from typing import Dict, List, Tuple
-
+import os
 import requests
 import torch
 import statistics
@@ -24,7 +24,6 @@ from dataclasses import dataclass
 # ---------------------------
 # CONFIG (flexible experiment control)
 # ---------------------------
-import os
 
 # Core FL setup
 MODEL_NAME = os.environ.get("MODEL_NAME", "distilgpt2")
@@ -41,6 +40,11 @@ CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "5"))
 
 # Server communication
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
+CLIENT_REQUEST_TIMEOUT = int(os.environ.get("CLIENT_REQUEST_TIMEOUT", "300"))
+
+# Trim ratio for robust aggregation (drop ratio on each tail)
+ROBUST_TRIM_RATIO = float(os.environ.get("ROBUST_TRIM_RATIO", "0.2"))
+
 
 # Attack config (for simulation)
 SIMULATE_ATTACK = os.environ.get("SIMULATE_ATTACK", "True").lower() in ("1", "true", "yes")
@@ -125,6 +129,7 @@ class MetricsRecorder:
                     "mem_vm_size","mem_vm_rss","mem_vm_hwm","mem_vm_swap",
                     "disk_rss_file","disk_rss_shmem",
                     "overhead_round_total_sec","overhead_detection_sec",
+                    "run_tag","summary_auc","summary_ttd","record_type",
                 ])
 
     def _append_round_row(self, r: int, resource_usage: Dict[str, Dict[str, str]], overhead: Dict[str, float]):
@@ -159,7 +164,53 @@ class MetricsRecorder:
                 disk.get("rss_shmem", "unknown"),
                 overhead.get("round_total_sec", 0.0),
                 overhead.get("detection_sec", 0.0),
+                self.run_tag(),
+                "",
+                "",
+                "round",
             ])
+
+
+
+    def run_tag(self) -> str:
+        return (
+            f"{self.exp.detector}_Nm{self.exp.Nm}_q{self.exp.q_participation}"
+            f"_p{self.exp.p_attack}_{self.exp.attack_type}_seed{self.exp.seed}"
+        )
+
+    def append_summary_row(self, summary: Dict[str, any]):
+        with open(self.csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                self.exp.seed,
+                self.exp.detector,
+                self.exp.Nm,
+                self.exp.q_participation,
+                self.exp.p_attack,
+                self.exp.attack_type,
+                "",
+                "",
+                "",
+                "[]",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                self.run_tag(),
+                summary.get("AUC", ""),
+                summary.get("TTD", ""),
+                "summary",
+            ])
+
+
 
     def log_round(
         self,
@@ -331,13 +382,16 @@ class DMMCoordinator:
         def register_client():
            data = request.json
            device_id = data["device_id"]
-           addr = request.remote_addr
            is_malicious = bool(data.get("malicious", False))
            host, port = data["address"].split(":")
-           self.device_registry[device_id] = {'ip': addr, 'port': port, 'malicious': is_malicious, 'last_seen': time.time()}
-           print(f"[SERVER] Registered client: {device_id} ({addr}:{port})")
+           remote_addr = request.remote_addr
+           # 0.0.0.0/127.0.0.1 are bind addresses, not routable callback targets from peer containers.
+           # If the advertised host is non-routable, fallback to the observed remote address.
+           if host in ("0.0.0.0", "127.0.0.1", "localhost"):
+               host = remote_addr
+           self.device_registry[device_id] = {'ip': host, 'port': port, 'malicious': is_malicious, 'last_seen': time.time()}
+           print(f"[SERVER] Registered client: {device_id} ({host}:{port})")
            return jsonify({"status": "ok"})
-
 
         @app.route("/resource_usage", methods=["GET"])
         def resource_usage_endpoint():
@@ -480,6 +534,26 @@ class DMMCoordinator:
         tensors_list = [ b64_to_state_dict(b64) for b64 in updates_list ]
         # simple mean aggregation
         agg = copy.deepcopy(tensors_list[0])
+
+
+        if method == "trimmed_mean":
+            # Coordinate-wise trimmed mean over client deltas.
+            # If too few clients to trim, fallback to mean.
+            n = len(tensors_list)
+            trim_k = int(n * ROBUST_TRIM_RATIO)
+            can_trim = (n - 2 * trim_k) > 0 and trim_k > 0
+            for k in agg.keys():
+                stacked = torch.stack([t[k] for t in tensors_list], dim=0)  # [n, ...]
+                if can_trim:
+                    sorted_vals, _ = torch.sort(stacked, dim=0)
+                    trimmed = sorted_vals[trim_k:n - trim_k]
+                    agg[k] = torch.mean(trimmed, dim=0)
+                else:
+                    agg[k] = torch.mean(stacked, dim=0)
+            return agg
+
+        # default: simple mean aggregation
+
         for k in agg.keys():
             agg[k] = agg[k].clone()
         for t in tensors_list[1:]:
@@ -541,6 +615,7 @@ class DMMCoordinator:
        active_clients = random.sample(all_clients, k=m)
        
        Nm = getattr(self.exp, "Nm", NUM_MODELS)
+       recent_deltas_for_flanders = []
 
        # per-model sampling
        if exp.rotation:
@@ -590,7 +665,7 @@ class DMMCoordinator:
                 }
                 url = f"http://{addr}:{port}/train"
                 try:
-                    resp = requests.post(url, json=payload, timeout=120)
+                    resp = requests.post(url, json=payload, timeout=CLIENT_REQUEST_TIMEOUT)
                     resp.raise_for_status()
                     result = resp.json()
                     delta_b64 = result["delta_b64"]
@@ -610,7 +685,9 @@ class DMMCoordinator:
                     continue
                 if len(model_updates[i]) == 0:
                     continue
-                agg_delta = self.aggregate_and_apply(model_updates[i], method="mean")
+                agg_method = "trimmed_mean" if exp.detector == "ROBUST" else "mean"
+                agg_delta = self.aggregate_and_apply(model_updates[i], method=agg_method)
+
                 # apply to server-side model i
                 # new_state = old + delta  (delta crafted as new - old by client)
                 old_state = self.get_state(i)
@@ -758,6 +835,8 @@ class DMMCoordinator:
         # Metrics are already appended per-round to the combined csv_path.
         tag = f"{exp.detector}_Nm{exp.Nm}_q{exp.q_participation}_p{exp.p_attack}_{exp.attack_type}_seed{exp.seed}"
         summ = mr.summary()
+        mr.append_summary_row(summ)
+        tag = mr.run_tag()
         print(f"[SERVER] {tag}  AUC={summ['AUC']:.3f}  TTD={summ['TTD']}  csv={csv_path}")
 
 
@@ -777,7 +856,7 @@ if __name__ == "__main__":
 
     qs = [0.2, 0.5, 0.8]
     ps = [0.05, 0.10, 0.20]
-    nms = [1, 2, 3, 5]
+    nms = [3, 5]
     atks = ["slow_drift", "scaled", "backdoor"]
     seeds = [1, 2, 3]
 

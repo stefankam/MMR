@@ -9,6 +9,7 @@ import io
 import json
 import random
 import csv
+import math
 import time
 from typing import Dict, List, Tuple
 import os
@@ -16,10 +17,11 @@ import requests
 import torch
 import statistics
 import copy
-
+import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.optim import AdamW
 from topology_server import TopologyServer  # local helper (same directory)
+from flanders_strategies.aggregate import aggregate_dnc
 from dataclasses import dataclass
 # ---------------------------
 # CONFIG (flexible experiment control)
@@ -27,7 +29,7 @@ from dataclasses import dataclass
 
 # Core FL setup
 MODEL_NAME = os.environ.get("MODEL_NAME", "distilgpt2")
-ROUNDS = int(os.environ.get("ROUNDS", "2"))
+ROUNDS = int(os.environ.get("ROUNDS", "10"))
 
 # MMR parameters
 NUM_MODELS = int(os.environ.get("MMR_NUM_MODELS", "5"))
@@ -251,7 +253,7 @@ class MetricsRecorder:
 
 
     def summary(self) -> Dict[str, any]:
-        # simple AUC (ROC) via rank/trapezoid approximation on discrete thresholds
+        # Rank-based ROC-AUC with tie handling.
         y = [1 if self.attack_active[r] else 0 for r in sorted(self.round_scores.keys())]
         s = [self.round_scores[r] for r in sorted(self.round_scores.keys())]
         # compute ROC points
@@ -476,7 +478,8 @@ class DMMCoordinator:
         if self.probe_variance_baseline is None:
             self.probe_variance_baseline = max(var_probe, 1e-6)
         if var_probe > beta * self.probe_variance_baseline:
-            flags.append(("probe-variance-spike", i, var_probe, self.probe_variance_baseline))
+            # (flag_name, variance, baseline)
+            flags.append(("probe-variance-spike", var_probe, self.probe_variance_baseline))
 
         # simple cluster-split heuristic
         if max(tri) > 4.0 * med + 1e-6:
@@ -525,6 +528,8 @@ class DMMCoordinator:
                 print("[SERVER] Probe variance spike — increasing monitoring")
                 # update baseline to be more conservative
                 self.probe_variance_baseline = (self.probe_variance_baseline + f[1]) / 2.0
+                _, var_probe, _ = f
+                self.probe_variance_baseline = (self.probe_variance_baseline + var_probe) / 2.0
 
     def aggregate_and_apply(self, updates_list: List[Dict[str,str]], method="mean"):
         """
@@ -564,21 +569,37 @@ class DMMCoordinator:
         return agg
 
 
+    def flanders_score(
+        self,
+        recent_client_deltas: List[Dict[str, torch.Tensor]],
+        W: int,
+        expected_malicious: int = 1,
+    ) -> float:
+        """
+        FLANDERS/DnC-inspired score:
+        1) Convert recent deltas to NDArrays format
+        2) Run DnC aggregation (aggregate_dnc) to get robust center
+        3) Score as max L2 distance from each update to robust center
+        """
+        window = recent_client_deltas[-W:]
+        if len(window) < 2:
+            return 0.0
 
-    def flanders_score(self, recent_client_deltas: List[Dict[str, torch.Tensor]], W: int) -> float:
-        # Proxy: use rolling variance of flattened deltas in the last W requests
-        if not recent_client_deltas:
-            return 0.0
-        vecs = []
-        for sd in recent_client_deltas[-W:]:
-            parts = [v.reshape(-1) for v in sd.values()]
-            vecs.append(torch.cat(parts))
-        M = torch.stack(vecs, dim=0)  # [w, D]
-        # normalize per-dim, compute mean variance as scalar score
-        if M.shape[0] < 2:
-            return 0.0
-        var = torch.var(M, dim=0, unbiased=False).mean().item()
-        return float(var)
+        keys = list(window[0].keys())
+        results = []
+        flat_updates = []
+        for sd in window:
+            nds = [sd[k].detach().cpu().numpy() for k in keys]
+            results.append((nds, 1))
+            flat_updates.append(np.concatenate([a.reshape(-1) for a in nds], axis=0))
+
+        num_mal = max(1, min(expected_malicious, len(results) - 1))
+        robust_nds = aggregate_dnc(results, c=1.0, b=0, niters=1, num_malicious=num_mal)
+        robust_center = np.concatenate([a.reshape(-1) for a in robust_nds], axis=0)
+
+        dists = [float(np.linalg.norm(v - robust_center)) for v in flat_updates]
+        return max(dists) if dists else 0.0
+
 
 
     def init_models(self):
@@ -627,6 +648,8 @@ class DMMCoordinator:
        else:
             same = random.sample(active_clients, k=min(CLIENTS_PER_MODEL, len(active_clients)))
             mapping = {i: same for i in range(Nm)}
+
+       recent_deltas_for_flanders = []
 
        for r in range(1, rounds+1):
         round_start = time.perf_counter()
@@ -722,7 +745,9 @@ class DMMCoordinator:
             elif exp.detector == "FLANDERS":
                 # score = sliding-window variance over recent deltas
                 W = max(FL_W_MIN, min(FL_W_MAX, exp.flanders_W))
-                score = self.flanders_score(recent_deltas_for_flanders, W)
+                exp_mal = max(1, int(round(exp.p_attack * max(1, len(recent_deltas_for_flanders)))))
+                score = self.flanders_score(recent_deltas_for_flanders, W, expected_malicious=exp_mal)
+
                 # turn score into flags via simple threshold learned from EMA baseline
                 if not hasattr(self, "fl_base"):
                     self.fl_base = max(score, 1e-9)
@@ -770,8 +795,8 @@ class DMMCoordinator:
                           detected_clients.add(f"Device_{i}")
                           detected_clients.add(f"Device_{j}")
                        elif f[0] == "probe-variance-spike":
-                          _, i, *_ = f
-                          detected_clients.add(f"Device_{i}")
+                          # Global signal; no specific model/client offender is encoded.
+                          pass
                        elif isinstance(f, tuple) and len(f) == 2 and isinstance(f[1], bool):
                           cid, flag = f
                           if flag:
@@ -837,8 +862,8 @@ class DMMCoordinator:
         summ = mr.summary()
         mr.append_summary_row(summ)
         tag = mr.run_tag()
-        print(f"[SERVER] {tag}  AUC={summ['AUC']:.3f}  TTD={summ['TTD']}  csv={csv_path}")
-
+        auc_str = "NA" if summ["AUC"] is None else f"{summ['AUC']:.3f}"
+        print(f"[SERVER] {tag}  AUC={auc_str}  TTD={summ['TTD']}  csv={csv_path}")
 
 
 if __name__ == "__main__":
@@ -855,10 +880,10 @@ if __name__ == "__main__":
     print(f"[SERVER] All clients registered: {list(server.device_registry.keys())}")
 
     qs = [0.2, 0.5, 0.8]
-    ps = [0.05, 0.10, 0.20]
+    ps = [0.20]
     nms = [3, 5]
-    atks = ["slow_drift", "scaled", "backdoor"]
-    seeds = [1, 2, 3]
+    atks = ["backdoor"]
+    seeds = [1]
 
     # Choose detector per sweep (repeat this block for each method: NONE, ROBUST, FLANDERS, MMR)
     # Loop over detectors and experiment configs

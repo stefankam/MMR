@@ -127,6 +127,7 @@ class MetricsRecorder:
                 w = csv.writer(f)
                 w.writerow([
                     "seed","detector","Nm","q","p","attack","round","y_true","score","flags",
+                    "fpr",
                     "cpu_threads","cpu_allowed_list","cpu_voluntary_ctxt_switches","cpu_nonvoluntary_ctxt_switches",
                     "mem_vm_size","mem_vm_rss","mem_vm_hwm","mem_vm_swap",
                     "disk_rss_file","disk_rss_shmem",
@@ -134,7 +135,15 @@ class MetricsRecorder:
                     "run_tag","summary_auc","summary_ttd","record_type",
                 ])
 
-    def _append_round_row(self, r: int, resource_usage: Dict[str, Dict[str, str]], overhead: Dict[str, float]):
+
+    def _append_round_row(
+        self,
+        r: int,
+        resource_usage: Dict[str, Dict[str, str]],
+        overhead: Dict[str, float],
+        fpr: float,
+        summary: Dict[str, any],
+    ):
         y = 1 if self.attack_active[r] else 0
         s = self.round_scores[r]
         fl = self.round_flags[r]
@@ -154,6 +163,7 @@ class MetricsRecorder:
                 y,
                 s,
                 repr(fl),
+                fpr,
                 cpu.get("threads", "unknown"),
                 cpu.get("cpus_allowed_list", "unknown"),
                 cpu.get("voluntary_ctxt_switches", "unknown"),
@@ -167,8 +177,8 @@ class MetricsRecorder:
                 overhead.get("round_total_sec", 0.0),
                 overhead.get("detection_sec", 0.0),
                 self.run_tag(),
-                "",
-                "",
+                summary.get("AUC"),
+                summary.get("TTD"),
                 "round",
             ])
 
@@ -181,6 +191,10 @@ class MetricsRecorder:
         )
 
     def append_summary_row(self, summary: Dict[str, any]):
+        auc = summary.get("AUC")
+        auc_cell = "" if auc is None else auc
+        ttd = summary.get("TTD")
+        ttd_cell = "" if ttd is None else ttd
         with open(self.csv_path, "a", newline="") as f:
             w = csv.writer(f)
             w.writerow([
@@ -193,25 +207,17 @@ class MetricsRecorder:
                 "",
                 "",
                 "",
-                "[]",
+                "",
+                "","","","",
+                "","","","",
+                "","",
                 "",
                 "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                self.run_tag(),
-                summary.get("AUC", ""),
-                summary.get("TTD", ""),
+                self._run_tag,
+                auc_cell,
+                ttd_cell,
                 "summary",
             ])
-
 
 
     def log_round(
@@ -226,9 +232,16 @@ class MetricsRecorder:
         self.round_scores[r] = score
         self.round_flags[r] = flags
         self.attack_active[r] = attack_any
-        self._append_round_row(r, resource_usage, overhead)
         if attack_any and flags and self.first_detect_round is None:
             self.first_detect_round = r
+        y_all = [1 if self.attack_active[k] else 0 for k in sorted(self.attack_active.keys())]
+        pred_all = [1 if self.round_flags[k] else 0 for k in sorted(self.round_flags.keys())]
+        fp = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 1)
+        tn = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 0)
+        fpr = fp / (fp + tn + 1e-9)
+        current_summary = self.summary()
+        self._append_round_row(r, resource_usage, overhead, fpr, current_summary)
+
 
     def export_csv(self, fname: str):
         # ROC/AUC wants (y_true,y_score) per round; we also dump flags
@@ -236,21 +249,33 @@ class MetricsRecorder:
             w = csv.writer(f)
             w.writerow([
                 "seed","detector","Nm","q","p","attack","round","y_true","score","flags",
+                "fpr",
                 "cpu_threads","cpu_allowed_list","cpu_voluntary_ctxt_switches","cpu_nonvoluntary_ctxt_switches",
                 "mem_vm_size","mem_vm_rss","mem_vm_hwm","mem_vm_swap",
                 "disk_rss_file","disk_rss_shmem",
                 "overhead_round_total_sec","overhead_detection_sec",
+                "run_tag","summary_auc","summary_ttd","record_type",
             ])
             for r in sorted(self.round_scores.keys()):
                 y = 1 if self.attack_active[r] else 0
                 s = self.round_scores[r]
                 fl = self.round_flags[r]
-                w.writerow([self.exp.seed, self.exp.detector, self.exp.Nm, self.exp.q_participation,
-                            self.exp.p_attack, self.exp.attack_type, r, y, s, repr(fl),
-                            "unknown","unknown","unknown","unknown",
-                            "unknown","unknown","unknown","unknown",
-                            "unknown","unknown",0.0,0.0])
-
+                y_all = [1 if self.attack_active[k] else 0 for k in sorted(self.attack_active.keys()) if k <= r]
+                pred_all = [1 if self.round_flags[k] else 0 for k in sorted(self.round_flags.keys()) if k <= r]
+                fp = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 1)
+                tn = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 0)
+                fpr = fp / (fp + tn + 1e-9)
+                summ = self.summary()
+                row = [
+                    self.exp.seed, self.exp.detector, self.exp.Nm, self.exp.q_participation,
+                    self.exp.p_attack, self.exp.attack_type, r, y, s, repr(fl),
+                    fpr,
+                    "unknown", "unknown", "unknown", "unknown",
+                    "unknown", "unknown", "unknown", "unknown",
+                    "unknown", "unknown", 0.0, 0.0,
+                    self._run_tag, summ.get("AUC"), summ.get("TTD"), "round",
+                ]
+                w.writerow(row)
 
     def summary(self) -> Dict[str, any]:
         # Rank-based ROC-AUC with tie handling.

@@ -3,9 +3,17 @@ from typing import Any, Callable, List, Tuple
 
 import numpy as np
 
-from flwr.common import NDArray, NDArrays, parameters_to_ndarrays
-from flwr.server.strategy.aggregate import aggregate, _compute_distances
-from ..utils import flatten_params
+from flwr.common import NDArrays
+from flwr.server.strategy.aggregate import aggregate
+
+
+def flatten_params(params: NDArrays) -> np.ndarray:
+    """Flatten a list of layer arrays into one 1D vector."""
+    if not params:
+        return np.array([], dtype=np.float32)
+    return np.concatenate([np.asarray(layer).ravel() for layer in params], axis=0)
+
+
 
 def aggregate_dnc(results: List[Tuple[NDArrays, int]], c: float, b: int, niters: int, num_malicious: int) -> NDArrays:
     num_clients = len(results)

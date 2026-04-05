@@ -781,9 +781,24 @@ class DMMCoordinator:
                 pass
             
             elif exp.detector == "ROBUST":
-                # Robust-agg baseline: do trimmed mean for aggregation (already aggregated above);
-                # detection power expected low; still compute a soft score as 0
-                pass
+                # ROBUST baseline:
+                # - aggregation already used trimmed mean above
+                # - here we produce a lightweight score/flag from client update-norm dispersion
+                #   so summary AUC/TTD remain meaningful for this baseline.
+                update_norms = []
+                for delta_b64 in client_updates.values():
+                    delta_state = b64_to_state_dict(delta_b64)
+                    vec = torch.cat([v.reshape(-1) for v in delta_state.values()])
+                    update_norms.append(float(torch.norm(vec)))
+
+                if update_norms:
+                    med = statistics.median(update_norms)
+                    mad = statistics.median([abs(x - med) for x in update_norms]) if len(update_norms) > 1 else 0.0
+                    max_norm = max(update_norms)
+                    score = float((max_norm - med) / (mad + 1e-6))
+                    threshold = med + 3.0 * (mad if mad > 0 else 1e-6)
+                    if max_norm > threshold:
+                        flags.append(("robust-norm-outlier", max_norm, threshold))
             
             elif exp.detector == "FLANDERS":
                 # score = sliding-window variance over recent deltas
@@ -935,7 +950,7 @@ if __name__ == "__main__":
         os.remove(all_results_csv)
 
 
-    for DET in ["MMR", "ROBUST", "FLANDERS", "NONE"]:
+    for DET in ["MMR", "FLANDERS", "ROBUST", "NONE"]:
         for q in qs:
             for p in ps:
                 for Nm in nms:

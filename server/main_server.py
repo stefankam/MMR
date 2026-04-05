@@ -273,14 +273,32 @@ class MetricsRecorder:
         auc = 0.0
         for (x1,y1),(x2,y2) in zip(pts, pts[1:]):
             auc += (x2 - x1) * (y1 + y2) / 2.0
-        TTD = None
-        if self.first_detect_round is not None:
-            # t0: first attack round
-            t0 = min([r for r,v in self.attack_active.items() if v], default=None)
-            if t0 is not None:
-                TTD = max(0, self.first_detect_round - t0)
-        return {"AUC": auc, "TTD": TTD}
+        # Per-round episode TTD:
+        # - starts at 0 on attack start round,
+        # - increases while attack episode has no flag,
+        # - returns to 0 once a flag appears for that episode.
+        TTD = 0.0
+        rounds_sorted = sorted(self.round_scores.keys())
+        if rounds_sorted:
+            attack_starts = []
+            prev_attack = False
+            for rr in rounds_sorted:
+                cur_attack = bool(self.attack_active.get(rr, False))
+                if cur_attack and not prev_attack:
+                    attack_starts.append(rr)
+                prev_attack = cur_attack
 
+            if attack_starts:
+                current_r = rounds_sorted[-1]
+                latest_start = max(attack_starts)
+                detected = any(
+                    bool(self.round_flags.get(rr))
+                    for rr in rounds_sorted
+                    if latest_start <= rr <= current_r
+                )
+                if not detected:
+                    TTD = float(max(0, current_r - latest_start))
+        return {"AUC": auc, "TTD": TTD}
 
 
 
@@ -860,10 +878,10 @@ class DMMCoordinator:
         # Metrics are already appended per-round to the combined csv_path.
         tag = f"{exp.detector}_Nm{exp.Nm}_q{exp.q_participation}_p{exp.p_attack}_{exp.attack_type}_seed{exp.seed}"
         summ = mr.summary()
-        mr.append_summary_row(summ)
-        tag = mr.run_tag()
         auc_str = "NA" if summ["AUC"] is None else f"{summ['AUC']:.3f}"
         print(f"[SERVER] {tag}  AUC={auc_str}  TTD={summ['TTD']}  csv={csv_path}")
+
+
 
 
 if __name__ == "__main__":
@@ -879,9 +897,9 @@ if __name__ == "__main__":
         time.sleep(5)
     print(f"[SERVER] All clients registered: {list(server.device_registry.keys())}")
 
-    qs = [0.2, 0.5, 0.8]
-    ps = [0.20]
-    nms = [3, 5]
+    qs = [0.2]
+    ps = [0.2]
+    nms = [3]
     atks = ["backdoor"]
     seeds = [1]
 

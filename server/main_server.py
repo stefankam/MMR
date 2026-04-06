@@ -10,6 +10,7 @@ import json
 import random
 import csv
 import math
+import gc
 import time
 from typing import Dict, List, Tuple
 import os
@@ -385,6 +386,7 @@ def get_resource_usage() -> Dict[str, Dict[str, str]]:
 # ---------------------------
 class DMMCoordinator:
     def __init__(self, model_name: str, topology_url: str, exp: ExperimentConfig = None):
+        self.model_name = model_name
         self.device_registry =  {}
         self.topology = TopologyServer(topology_url)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -487,7 +489,7 @@ class DMMCoordinator:
         losses = []
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for i in range(Nm):
-            m = copy.deepcopy(self.models[i]).to(device).eval()
+            m = self.models[i].to(device).eval()
             total = 0.0
             n = 0
             with torch.no_grad():
@@ -497,6 +499,8 @@ class DMMCoordinator:
                     total += out.loss.item()
                     n += 1
             losses.append(total / max(1, n))
+            if device.type != "cpu":
+                self.models[i] = self.models[i].to("cpu")
         return losses
 
     def detect_anomalies(self, D, probe_losses, alpha=3.0, beta=2.0):
@@ -645,22 +649,53 @@ class DMMCoordinator:
 
 
 
-    def init_models(self):
-        """(Re)initialize models according to self.exp.Nm"""
-        Nm = getattr(self.exp, "Nm", NUM_MODELS) 
+    def init_models(self, nm: int = None):
+        """(Re)initialize models according to requested Nm."""
+        if nm is None:
+            nm = int(getattr(self.exp, "Nm", len(self.models) if hasattr(self, "models") else NUM_MODELS))
         self.models = [
             AutoModelForCausalLM.from_pretrained(self.model_name).cpu()
-            for _ in range(self.exp.Nm)
+            for _ in range(nm)
         ]
         for m in self.models:
             m.resize_token_embeddings(len(self.tokenizer))
-        print(f"[SERVER] Initialized {self.exp.Nm} models for detector={self.exp.detector}")
+
+
+        print(f"[SERVER] Initialized {nm} models")
+
+    def reset_for_experiment(self, exp: ExperimentConfig):
+        """Reset mutable state before each experiment configuration."""
+        self.exp = exp
+        self.models = []
+        gc.collect()
+        self.init_models(exp.Nm)
+        self.checkpoints = {}
+        self.safe_round = 0
+        self.quarantined = set()
+        self.probe_variance_baseline = None
+        self.fl_base = None
 
 
     def run_rounds(self, rounds=ROUNDS, exp: ExperimentConfig=None, csv_path: str = "signaltest_all_runs.csv"):
+       if exp is not None:
+            self.exp = exp
+       if self.exp is None:
+            raise ValueError("run_rounds requires an experiment config (exp).")
+
+       Nm = int(getattr(self.exp, "Nm", len(self.models)))
+       # Safety: ensure server model count matches requested experiment Nm.
+       if len(self.models) != Nm:
+            self.init_models(Nm)
+
+       # reset per-experiment mutable state to avoid cross-run contamination
+       self.quarantined = set()
+       self.checkpoints = {}
+       self.safe_round = 0
+       self.probe_variance_baseline = None
+       self.fl_base = None
+
        # initial checkpoint
        self.checkpoints[0] = self.consensus_state()
-       self.safe_round = 0
 
        # ✅ ADD THIS HERE
        mr = MetricsRecorder(exp, csv_path)
@@ -678,7 +713,7 @@ class DMMCoordinator:
        m = max(1, int(exp.q_participation * len(all_clients)))
        active_clients = random.sample(all_clients, k=m)
        
-       Nm = getattr(self.exp, "Nm", NUM_MODELS)
+       Nm = int(getattr(self.exp, "Nm", NUM_MODELS))
        recent_deltas_for_flanders = []
 
        # per-model sampling
@@ -801,13 +836,10 @@ class DMMCoordinator:
                         flags.append(("robust-norm-outlier", max_norm, threshold))
             
             elif exp.detector == "FLANDERS":
-                # score = sliding-window variance over recent deltas
                 W = max(FL_W_MIN, min(FL_W_MAX, exp.flanders_W))
                 exp_mal = max(1, int(round(exp.p_attack * max(1, len(recent_deltas_for_flanders)))))
                 score = self.flanders_score(recent_deltas_for_flanders, W, expected_malicious=exp_mal)
-
-                # turn score into flags via simple threshold learned from EMA baseline
-                if not hasattr(self, "fl_base"):
+                if self.fl_base is None:
                     self.fl_base = max(score, 1e-9)
                 if score > 3.0 * self.fl_base:
                     flags.append(("flanders-spike", score, self.fl_base))
@@ -937,9 +969,9 @@ if __name__ == "__main__":
         time.sleep(5)
     print(f"[SERVER] All clients registered: {list(server.device_registry.keys())}")
 
-    qs = [0.2]
+    qs = [0.2,0.5]
     ps = [0.2]
-    nms = [3]
+    nms = [1,3]
     atks = ["backdoor"]
     seeds = [1]
 
@@ -950,7 +982,7 @@ if __name__ == "__main__":
         os.remove(all_results_csv)
 
 
-    for DET in ["MMR", "FLANDERS", "ROBUST", "NONE"]:
+    for DET in ["FLANDERS", "ROBUST", "NONE", "MMR"]:
         for q in qs:
             for p in ps:
                 for Nm in nms:
@@ -971,6 +1003,8 @@ if __name__ == "__main__":
                                 rho_overlap=SAMPLING_OVERLAP_RHO,
                                 mitigation=True
                             )
+
+                            server.reset_for_experiment(exp)
 
                             # --- Run experiment ---
                             server.run_rounds(rounds=exp.rounds, exp=exp, csv_path=all_results_csv)

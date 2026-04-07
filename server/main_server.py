@@ -11,6 +11,7 @@ import random
 import csv
 import math
 import gc
+from collections import deque
 import time
 from typing import Dict, List, Tuple
 import os
@@ -489,7 +490,7 @@ class DMMCoordinator:
         losses = []
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for i in range(Nm):
-            m = self.models[i].to(device).eval()
+            m = copy.deepcopy(self.models[i]).to(device).eval()
             total = 0.0
             n = 0
             with torch.no_grad():
@@ -499,8 +500,6 @@ class DMMCoordinator:
                     total += out.loss.item()
                     n += 1
             losses.append(total / max(1, n))
-            if device.type != "cpu":
-                self.models[i] = self.models[i].to("cpu")
         return losses
 
     def detect_anomalies(self, D, probe_losses, alpha=3.0, beta=2.0):
@@ -628,10 +627,11 @@ class DMMCoordinator:
         2) Run DnC aggregation (aggregate_dnc) to get robust center
         3) Score as max L2 distance from each update to robust center
         """
-        window = recent_client_deltas[-W:]
+        # recent_client_deltas may be a deque (not sliceable), so normalize first.
+        all_recent = list(recent_client_deltas)
+        window = all_recent[-W:]
         if len(window) < 2:
             return 0.0
-
         keys = list(window[0].keys())
         results = []
         flat_updates = []
@@ -662,18 +662,6 @@ class DMMCoordinator:
 
 
         print(f"[SERVER] Initialized {nm} models")
-
-    def reset_for_experiment(self, exp: ExperimentConfig):
-        """Reset mutable state before each experiment configuration."""
-        self.exp = exp
-        self.models = []
-        gc.collect()
-        self.init_models(exp.Nm)
-        self.checkpoints = {}
-        self.safe_round = 0
-        self.quarantined = set()
-        self.probe_variance_baseline = None
-        self.fl_base = None
 
 
     def run_rounds(self, rounds=ROUNDS, exp: ExperimentConfig=None, csv_path: str = "signaltest_all_runs.csv"):
@@ -728,6 +716,10 @@ class DMMCoordinator:
             mapping = {i: same for i in range(Nm)}
 
        recent_deltas_for_flanders = []
+
+       flanders_buf_len = max(2, int(max(FL_W_MAX, getattr(exp, "flanders_W", FL_W_MAX))))
+       recent_deltas_for_flanders = deque(maxlen=flanders_buf_len)
+
 
        for r in range(1, rounds+1):
         round_start = time.perf_counter()
@@ -1004,7 +996,6 @@ if __name__ == "__main__":
                                 mitigation=True
                             )
 
-                            server.reset_for_experiment(exp)
 
                             # --- Run experiment ---
                             server.run_rounds(rounds=exp.rounds, exp=exp, csv_path=all_results_csv)

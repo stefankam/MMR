@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 # Core FL setup
 MODEL_NAME = os.environ.get("MODEL_NAME", "distilgpt2")
-ROUNDS = int(os.environ.get("ROUNDS", "10"))
+ROUNDS = int(os.environ.get("ROUNDS", "20"))
 
 # MMR parameters
 NUM_MODELS = int(os.environ.get("MMR_NUM_MODELS", "5"))
@@ -459,9 +459,10 @@ class DMMCoordinator:
 
     def consensus_state(self):
         # average non-quarantined models
-        active = [i for i in range(Nm) if i not in self.quarantined]
+        nm = len(self.models)
+        active = [i for i in range(nm) if i not in self.quarantined]
         if len(active) == 0:
-            active = list(range(Nm))
+            active = list(range(nm))
         states = [self.get_state(i) for i in active]
         agg = copy.deepcopy(states[0])
         for s in states[1:]:
@@ -663,6 +664,18 @@ class DMMCoordinator:
 
         print(f"[SERVER] Initialized {nm} models")
 
+    def reset_for_experiment(self, exp: ExperimentConfig):
+        """Reset mutable state before each experiment configuration."""
+        self.exp = exp
+        self.models = []
+        gc.collect()
+        self.init_models(exp.Nm)
+        self.checkpoints = {}
+        self.safe_round = 0
+        self.quarantined = set()
+        self.probe_variance_baseline = None
+        self.fl_base = None
+
 
     def run_rounds(self, rounds=ROUNDS, exp: ExperimentConfig=None, csv_path: str = "signaltest_all_runs.csv"):
        if exp is not None:
@@ -690,7 +703,12 @@ class DMMCoordinator:
 
        # build all registered clients
        all_clients = [
-            {"id": cid, "address": data["ip"], "port": int(data.get("port", 5000))}
+            {
+                "id": cid,
+                "address": data["ip"],
+                "port": int(data.get("port", 5000)),
+                "malicious": bool(data.get("malicious", False)),
+            }
             for cid, data in self.device_registry.items()
         ]
        if len(all_clients) == 0:
@@ -699,23 +717,7 @@ class DMMCoordinator:
         
        # sample participation q
        m = max(1, int(exp.q_participation * len(all_clients)))
-       active_clients = random.sample(all_clients, k=m)
-       
        Nm = int(getattr(self.exp, "Nm", NUM_MODELS))
-       recent_deltas_for_flanders = []
-
-       # per-model sampling
-       if exp.rotation:
-            # per model, draw CLIENTS_PER_MODEL_DEFAULT from active_clients
-            mapping = {
-                i: random.sample(active_clients, k=min(CLIENTS_PER_MODEL, len(active_clients)))
-                for i in range(Nm)
-            }
-       else:
-            same = random.sample(active_clients, k=min(CLIENTS_PER_MODEL, len(active_clients)))
-            mapping = {i: same for i in range(Nm)}
-
-       recent_deltas_for_flanders = []
 
        flanders_buf_len = max(2, int(max(FL_W_MAX, getattr(exp, "flanders_W", FL_W_MAX))))
        recent_deltas_for_flanders = deque(maxlen=flanders_buf_len)
@@ -729,6 +731,18 @@ class DMMCoordinator:
         model_updates = {i: [] for i in range(Nm)}
         client_updates = {}
         client_contribs = {i: [] for i in range(Nm)}
+
+        # sample participation q every round
+        active_clients = random.sample(all_clients, k=m)
+        if exp.rotation:
+            mapping = {
+                i: random.sample(active_clients, k=min(CLIENTS_PER_MODEL, len(active_clients)))
+                for i in range(Nm)
+            }
+        else:
+            same = random.sample(active_clients, k=min(CLIENTS_PER_MODEL, len(active_clients)))
+            mapping = {i: same for i in range(Nm)}
+
         
         # any attacker this round?
         attack_any = False
@@ -739,9 +753,12 @@ class DMMCoordinator:
             sampled = mapping[i]
             for ce in sampled:
                 cid, addr, port = ce["id"], ce["address"], ce["port"]
-                # decide attacker per request (Bernoulli with p)
-                use_mal = (random.random() < exp.p_attack)
-                if use_mal: attack_any = True
+
+                # attack only from clients marked malicious-capable
+                is_malicious_client = bool(ce.get("malicious", False))
+                use_mal = is_malicious_client and (random.random() < exp.p_attack)
+                if use_mal:
+                    attack_any = True
 
                 state_b64 = state_dict_to_b64(self.get_state(i))
                 payload = {
@@ -771,180 +788,150 @@ class DMMCoordinator:
                 except Exception as e:
                     print(f"[SERVER] Error contacting client {cid} at {addr}:{port}: {e}")
 
-            # per-model aggregation and apply
-            for i in range(Nm):
-                if i in self.quarantined:
-                    print(f"[SERVER] Model {i} is quarantined — skip aggregation")
-                    continue
-                if len(model_updates[i]) == 0:
-                    continue
-                agg_method = "trimmed_mean" if exp.detector == "ROBUST" else "mean"
-                agg_delta = self.aggregate_and_apply(model_updates[i], method=agg_method)
 
-                # apply to server-side model i
-                # new_state = old + delta  (delta crafted as new - old by client)
-                old_state = self.get_state(i)
-                new_state = {}
-                for k in old_state.keys():
-                    new_state[k] = old_state[k] + agg_delta[k]
-                self.set_state(i, new_state)
+        # per-model aggregation and apply
+        for i in range(Nm):
+            if i in self.quarantined:
+                print(f"[SERVER] Model {i} is quarantined — skip aggregation")
+                continue
+            if len(model_updates[i]) == 0:
+                continue
+            agg_method = "trimmed_mean" if exp.detector == "ROBUST" else "mean"
+            agg_delta = self.aggregate_and_apply(model_updates[i], method=agg_method)
 
+            # apply to server-side model i
+            # new_state = old + delta  (delta crafted as new - old by client)
+            old_state = self.get_state(i)
+            new_state = {}
+            for k in old_state.keys():
+                new_state[k] = old_state[k] + agg_delta[k]
+            self.set_state(i, new_state)
 
+        # checkpoint
+        if r % CHECKPOINT_INTERVAL == 0:
+            self.checkpoints[r] = self.consensus_state()
+            self.safe_round = r
+            print(f"[SERVER] Stored safe checkpoint at round {r}")
 
-            
-            # checkpoint
-            if r % CHECKPOINT_INTERVAL == 0:
-                self.checkpoints[r] = self.consensus_state()
-                self.safe_round = r
-                print(f"[SERVER] Stored safe checkpoint at round {r}")
-            
-            # --- Detector selection & score ---
-            detection_start = time.perf_counter()
-            flags = []
-            score = 0.0
-            
-            if exp.detector == "NONE":
-                # no detection: score is 0; no flags
-                pass
-            
-            elif exp.detector == "ROBUST":
-                # ROBUST baseline:
-                # - aggregation already used trimmed mean above
-                # - here we produce a lightweight score/flag from client update-norm dispersion
-                #   so summary AUC/TTD remain meaningful for this baseline.
-                update_norms = []
-                for delta_b64 in client_updates.values():
-                    delta_state = b64_to_state_dict(delta_b64)
-                    vec = torch.cat([v.reshape(-1) for v in delta_state.values()])
-                    update_norms.append(float(torch.norm(vec)))
+        # --- Detector selection & score ---
+        detection_start = time.perf_counter()
+        flags = []
+        score = 0.0
 
-                if update_norms:
-                    med = statistics.median(update_norms)
-                    mad = statistics.median([abs(x - med) for x in update_norms]) if len(update_norms) > 1 else 0.0
-                    max_norm = max(update_norms)
-                    score = float((max_norm - med) / (mad + 1e-6))
-                    threshold = med + 3.0 * (mad if mad > 0 else 1e-6)
-                    if max_norm > threshold:
-                        flags.append(("robust-norm-outlier", max_norm, threshold))
-            
-            elif exp.detector == "FLANDERS":
-                W = max(FL_W_MIN, min(FL_W_MAX, exp.flanders_W))
-                exp_mal = max(1, int(round(exp.p_attack * max(1, len(recent_deltas_for_flanders)))))
-                score = self.flanders_score(recent_deltas_for_flanders, W, expected_malicious=exp_mal)
-                if self.fl_base is None:
-                    self.fl_base = max(score, 1e-9)
-                if score > 3.0 * self.fl_base:
-                    flags.append(("flanders-spike", score, self.fl_base))
-                    if exp.mitigation:
-                        # optional: quarantine most-offending model by last pairwise distance
-                        pass
-                # slowly update baseline
-                self.fl_base = 0.9 * self.fl_base + 0.1 * score
-            
-            elif exp.detector == "MMR":
-                D = self.compute_pairwise_distances()
-                probe_losses = self.compute_probe_losses()
-                # take a scalar score = max pairwise distance OR probe variance, whichever higher (signal)
-                tri = []
-                for a in range(Nm):
-                    for b in range(a+1, Nm):
-                        tri.append(D[a][b])
-                max_pair = max(tri) if tri else 0.0
-                varp = statistics.pvariance(probe_losses) if len(probe_losses) > 1 else 0.0
-                score = float(max(max_pair, varp))
-            
-                flags = self.detect_anomalies(D, probe_losses, alpha=ALPHA, beta=BETA)
-                if flags and exp.mitigation:
-                    self.respond_to_flags(flags, r, client_contribs, client_updates)
-                elif not flags:
-                    # update MMR baseline slowly (your original)
-                    varp_now = statistics.pvariance(probe_losses) if len(probe_losses)>1 else 0.0
-                    if self.probe_variance_baseline is None:
-                        self.probe_variance_baseline = max(varp_now, 1e-6)
-                    else:
-                        self.probe_variance_baseline = 0.9*self.probe_variance_baseline + 0.1*varp_now
-            
+        if exp.detector == "NONE":
+            # no detection: score is 0; no flags
+            pass
 
-                # --- Log which clients/models were flagged ---
-                if flags:
-                   print(f"[SERVER] Round {r}: Detected anomalies ({len(flags)} flags) → {flags}")
-                   detected_clients = set()
+        elif exp.detector == "ROBUST":
+            # ROBUST baseline:
+            # - aggregation already used trimmed mean above
+            # - here we produce a lightweight score/flag from client update-norm dispersion
+            #   so summary AUC/TTD remain meaningful for this baseline.
+            update_norms = []
+            for delta_b64 in client_updates.values():
+                delta_state = b64_to_state_dict(delta_b64)
+                vec = torch.cat([v.reshape(-1) for v in delta_state.values()])
+                update_norms.append(float(torch.norm(vec)))
 
-                   for f in flags:
-                       # Example: ('pairwise-divergence', 0, 1, ...)
-                       if f[0] == "pairwise-divergence":
-                          _, i, j, *_ = f
-                          detected_clients.add(f"Device_{i}")
-                          detected_clients.add(f"Device_{j}")
-                       elif f[0] == "probe-variance-spike":
-                          # Global signal; no specific model/client offender is encoded.
-                          pass
-                       elif isinstance(f, tuple) and len(f) == 2 and isinstance(f[1], bool):
-                          cid, flag = f
-                          if flag:
-                             detected_clients.add(cid)
- 
-                   mr.round_flags[r] = list(detected_clients)
-                   print("[DEBUG] Final round_flags =", mr.round_flags)
+            if update_norms:
+                med = statistics.median(update_norms)
+                mad = statistics.median([abs(x - med) for x in update_norms]) if len(update_norms) > 1 else 0.0
+                max_norm = max(update_norms)
+                score = float((max_norm - med) / (mad + 1e-6))
+                threshold = med + 3.0 * (mad if mad > 0 else 1e-6)
+                if max_norm > threshold:
+                    flags.append(("robust-norm-outlier", max_norm, threshold))
 
-                   if MMR_DIVERGENCE_MITIGATION:
-                      self.respond_to_flags(flags, r, client_contribs, client_updates)
-                   else:
-                      print(f"[SERVER] Detected anomalies but mitigation disabled (flags={flags})")
+        elif exp.detector == "FLANDERS":
+            W = max(FL_W_MIN, min(FL_W_MAX, exp.flanders_W))
+            exp_mal = max(1, int(round(exp.p_attack * max(1, len(recent_deltas_for_flanders)))))
+            score = self.flanders_score(recent_deltas_for_flanders, W, expected_malicious=exp_mal)
+            if self.fl_base is None:
+                self.fl_base = max(score, 1e-9)
+            if score > 3.0 * self.fl_base:
+                flags.append(("flanders-spike", score, self.fl_base))
+                if exp.mitigation:
+                    # optional: quarantine most-offending model by last pairwise distance
+                    pass
+            # slowly update baseline
+            self.fl_base = 0.9 * self.fl_base + 0.1 * score
 
-                   TP = FP = FN = TN = 0
-                   for cid, info in self.device_registry.items():
-                       gt_malicious = info.get("malicious", False)
-                       print("gt_malicious = info.get returns:", gt_malicious) 
-                       detected_any = any(
-                         cid in mr.round_flags.get(r, [])
-                         for r in range(1, rounds+1) 
-                       )
-        
-                   if gt_malicious and detected_any:
-                      TP += 1
-                   elif gt_malicious and not detected_any:
-                      FN += 1
-                   elif not gt_malicious and detected_any:
-                      FP += 1
-                   else:
-                      TN += 1
-                   TPR = TP / (TP + FN + 1e-6)
-                   FPR = FP / (FP + TN + 1e-6)
-                   print(f"[SERVER] Client-level Detection: TPR={TPR:.3f}, FPR={FPR:.3f}")
+        elif exp.detector == "MMR":
+            D = self.compute_pairwise_distances()
+            probe_losses = self.compute_probe_losses()
+            # take a scalar score = max pairwise distance OR probe variance, whichever higher (signal)
+            tri = []
+            for a in range(Nm):
+                for b in range(a + 1, Nm):
+                    tri.append(D[a][b])
+            max_pair = max(tri) if tri else 0.0
+            varp = statistics.pvariance(probe_losses) if len(probe_losses) > 1 else 0.0
+            score = float(max(max_pair, varp))
 
+            flags = self.detect_anomalies(D, probe_losses, alpha=ALPHA, beta=BETA)
+            if flags and exp.mitigation:
+                self.respond_to_flags(flags, r, client_contribs, client_updates)
+            elif not flags:
+                # update MMR baseline slowly (your original)
+                varp_now = statistics.pvariance(probe_losses) if len(probe_losses) > 1 else 0.0
+                if self.probe_variance_baseline is None:
+                    self.probe_variance_baseline = max(varp_now, 1e-6)
                 else:
-                    # update baseline slowly
-                    varp = statistics.pvariance(probe_losses) if len(probe_losses)>1 else 0.0
-                    if self.probe_variance_baseline is None:
-                        self.probe_variance_baseline = max(varp, 1e-6)
-                    else:
-                        self.probe_variance_baseline = 0.9*self.probe_variance_baseline + 0.1*varp
-                    print("[SERVER] No anomalies detected.")
+                    self.probe_variance_baseline = 0.9 * self.probe_variance_baseline + 0.1 * varp_now
+
+            # --- Log which clients/models were flagged ---
+            if flags:
+                print(f"[SERVER] Round {r}: Detected anomalies ({len(flags)} flags) → {flags}")
+                flagged_clients = set()
+                for f in flags:
+                    # Example: ('pairwise-divergence', 0, 1, ...)
+                    if f[0] == "pairwise-divergence":
+                        _, i, j, *_ = f
+                        flagged_clients.update(client_contribs.get(i, []))
+                        flagged_clients.update(client_contribs.get(j, []))
+                    elif f[0] == "probe-variance-spike":
+                        # Global signal; no specific model/client offender is encoded.
+                        pass
+
+                    elif isinstance(f, tuple) and len(f) == 2 and isinstance(f[1], bool):
+                        cid, flag = f
+                        if flag:
+                            flagged_clients.add(cid)
+
+                mr.round_flags[r] = list(flagged_clients)
+                print("[DEBUG] Final round_flags =", mr.round_flags)
+
+                if not MMR_DIVERGENCE_MITIGATION:
+                    print(f"[SERVER] Detected anomalies but mitigation disabled (flags={flags})")
+            else:
+                # update baseline slowly
+                varp = statistics.pvariance(probe_losses) if len(probe_losses) > 1 else 0.0
+
+                if self.probe_variance_baseline is None:
+                    self.probe_variance_baseline = max(varp, 1e-6)
+                else:
+
+                    self.probe_variance_baseline = 0.9 * self.probe_variance_baseline + 0.1 * varp
+                print("[SERVER] No anomalies detected.")
 
 
-
-
-            # log metrics
-            detection_elapsed = time.perf_counter() - detection_start
-            round_total_elapsed = time.perf_counter() - round_start
-            mr.log_round(
-                r,
-                score,
-                flags,
-                attack_any,
-                round_resource_usage,
-                {"round_total_sec": round_total_elapsed, "detection_sec": detection_elapsed},
-            )
-
-
-        print("[SERVER] Training rounds complete.")
-        # Metrics are already appended per-round to the combined csv_path.
-        tag = f"{exp.detector}_Nm{exp.Nm}_q{exp.q_participation}_p{exp.p_attack}_{exp.attack_type}_seed{exp.seed}"
-        summ = mr.summary()
-        auc_str = "NA" if summ["AUC"] is None else f"{summ['AUC']:.3f}"
-        print(f"[SERVER] {tag}  AUC={auc_str}  TTD={summ['TTD']}  csv={csv_path}")
-
+        # log metrics
+        detection_elapsed = time.perf_counter() - detection_start
+        round_total_elapsed = time.perf_counter() - round_start
+        mr.log_round(
+            r,
+            score,
+            flags,
+            attack_any,
+            round_resource_usage,
+            {"round_total_sec": round_total_elapsed, "detection_sec": detection_elapsed},
+        )
+       print("[SERVER] Training rounds complete.")
+       # Metrics are already appended per-round to the combined csv_path.
+       tag = f"{exp.detector}_Nm{exp.Nm}_q{exp.q_participation}_p{exp.p_attack}_{exp.attack_type}_seed{exp.seed}"
+       summ = mr.summary()
+       auc_str = "NA" if summ["AUC"] is None else f"{summ['AUC']:.3f}"
+       print(f"[SERVER] {tag}  AUC={auc_str}  TTD={summ['TTD']}  csv={csv_path}")
 
 
 
@@ -963,9 +950,9 @@ if __name__ == "__main__":
 
     qs = [0.2,0.5]
     ps = [0.2]
-    nms = [1,3]
+    nms = [3]
     atks = ["backdoor"]
-    seeds = [1]
+    seeds = [1,2,3]
 
     # Choose detector per sweep (repeat this block for each method: NONE, ROBUST, FLANDERS, MMR)
     # Loop over detectors and experiment configs
@@ -974,7 +961,7 @@ if __name__ == "__main__":
         os.remove(all_results_csv)
 
 
-    for DET in ["FLANDERS", "ROBUST", "NONE", "MMR"]:
+    for DET in ["MMR","FLANDERS","ROBUST", "NONE"]:
         for q in qs:
             for p in ps:
                 for Nm in nms:
@@ -996,6 +983,6 @@ if __name__ == "__main__":
                                 mitigation=True
                             )
 
-
+                            server.reset_for_experiment(exp)
                             # --- Run experiment ---
                             server.run_rounds(rounds=exp.rounds, exp=exp, csv_path=all_results_csv)

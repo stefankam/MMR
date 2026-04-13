@@ -36,6 +36,7 @@ CLIENT_PORT = int(os.environ.get("CLIENT_PORT", "5000"))
 CLIENT_HOST = os.environ.get("CLIENT_HOST", "0.0.0.0")
 LOCAL_NUM_PROMPTS = int(os.environ.get("LOCAL_NUM_PROMPTS", "16"))
 LOCAL_MAX_STEPS = int(os.environ.get("LOCAL_MAX_STEPS", "24"))
+MALICIOUS_CAPABLE_PROB = float(os.environ.get("MALICIOUS_CAPABLE_PROB", "1.0"))
 
 # Local client state
 client_id = None
@@ -46,7 +47,7 @@ if tokenizer.pad_token is None:
 # prepare local datasets (benign always available)
 local_benign = build_benign_prompts(num_per_client=LOCAL_NUM_PROMPTS)
 # some clients may have malicious data available
-has_malicious_data = random.random() < 1.0
+has_malicious_data = random.random() < MALICIOUS_CAPABLE_PROB
 if has_malicious_data:
     local_malicious = poison_prompts(local_benign, strength=0.6)
 else:

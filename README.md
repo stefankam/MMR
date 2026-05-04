@@ -5,10 +5,11 @@ This repository implements a **federated learning (FL) framework with Model Mult
 MMR maintains **multiple rotating global models** and detects anomalies through **cross-model divergence**, enabling robust detection of:
 
 * backdoor attacks
-* scaled-graient
-* slow-drift adversaries
+* scaled-gradient
+* slow-drift 
 
 and more
+
 ---
 
 ## ⚙️ Overview

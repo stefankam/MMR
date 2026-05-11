@@ -54,13 +54,16 @@ ROBUST_TRIM_RATIO = float(os.environ.get("ROBUST_TRIM_RATIO", "0.2"))
 SIMULATE_ATTACK = os.environ.get("SIMULATE_ATTACK", "True").lower() in ("1", "true", "yes")
 ATTACK_START_ROUND = int(os.environ.get("ATTACK_START_ROUND", "2"))
 ATTACK_END_ROUND = int(os.environ.get("ATTACK_END_ROUND", "999"))
-NUM_BYZANTINE_CLIENTS = int(os.environ.get("NUM_BYZANTINE_CLIENTS", "3"))
+NUM_BYZANTINE_CLIENTS = int(os.environ.get("NUM_BYZANTINE_CLIENTS", "10"))
+# Round-level ground-truth labeling:
+# mark y_true=1 only if at least this many attacked updates occurred in the round.
+ATTACK_MIN_UPDATES_FOR_POSITIVE = int(os.environ.get("ATTACK_MIN_UPDATES_FOR_POSITIVE", "2"))
 
 
 # Detector selection per run: {"NONE","MMR","FLANDERS"}
 # (We keep your MMR pairwise+probe detector; FLANDERS stub below.)
-ALPHA = float(os.environ.get("ALPHA", "3.0"))  # MMR MAD multiplier
-BETA  = float(os.environ.get("BETA",  "2.0"))  # probe variance spike factor
+ALPHA = float(os.environ.get("ALPHA", "2.0"))  # MMR MAD multiplier
+BETA  = float(os.environ.get("BETA",  "1.4"))  # probe variance spike factor
 
 # FLANDERS window length (sliding MAR residuals proxy)
 FL_W_MIN = int(os.environ.get("FL_W_MIN", "5"))
@@ -117,6 +120,7 @@ class MetricsRecorder:
         self.csv_path = csv_path
         self.rows = []   # one row per round
         self.round_flags: Dict[int, list] = {}
+        self.round_flagged_clients: Dict[int, list] = {}
         self.round_scores: Dict[int, float] = {}  # detector score per round
         self.attack_active: Dict[int, bool] = {}  # ground truth (any attacker selected this round)
         self.first_detect_round = None            # for TTD
@@ -236,8 +240,8 @@ class MetricsRecorder:
         self.attack_active[r] = attack_any
         if attack_any and flags and self.first_detect_round is None:
             self.first_detect_round = r
-        y_all = [1 if self.attack_active[k] else 0 for k in sorted(self.attack_active.keys())]
-        pred_all = [1 if self.round_flags[k] else 0 for k in sorted(self.round_flags.keys())]
+        y_all = [1 if self.attack_active[k] else 0 for k in sorted(self.round_scores.keys())]
+        pred_all = [1 if self.round_flags[k] else 0 for k in sorted(self.round_scores.keys())]
         fp = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 1)
         tn = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 0)
         fpr = fp / (fp + tn + 1e-9)
@@ -262,8 +266,8 @@ class MetricsRecorder:
                 y = 1 if self.attack_active[r] else 0
                 s = self.round_scores[r]
                 fl = self.round_flags[r]
-                y_all = [1 if self.attack_active[k] else 0 for k in sorted(self.attack_active.keys()) if k <= r]
-                pred_all = [1 if self.round_flags[k] else 0 for k in sorted(self.round_flags.keys()) if k <= r]
+                y_all = [1 if self.attack_active[k] else 0 for k in sorted(self.round_scores.keys()) if k <= r]
+                pred_all = [1 if self.round_flags[k] else 0 for k in sorted(self.round_scores.keys()) if k <= r]
                 fp = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 1)
                 tn = sum(1 for yy, pp in zip(y_all, pred_all) if yy == 0 and pp == 0)
                 fpr = fp / (fp + tn + 1e-9)
@@ -283,23 +287,22 @@ class MetricsRecorder:
         # Rank-based ROC-AUC with tie handling.
         y = [1 if self.attack_active[r] else 0 for r in sorted(self.round_scores.keys())]
         s = [self.round_scores[r] for r in sorted(self.round_scores.keys())]
-        # compute ROC points
-        thresholds = sorted(set(s), reverse=True)
-        if not thresholds:
-            return {"AUC": 0.0, "TTD": None}
-        pts = []
-        P = sum(y); N = len(y) - P
-        for th in thresholds:
-            tp = sum(1 for yy, ss in zip(y, s) if ss >= th and yy==1)
-            fp = sum(1 for yy, ss in zip(y, s) if ss >= th and yy==0)
-            tpr = tp / (P + 1e-9)
-            fpr = fp / (N + 1e-9)
-            pts.append((fpr, tpr))
-        # sort by FPR and trapezoid
-        pts = sorted(pts)
-        auc = 0.0
-        for (x1,y1),(x2,y2) in zip(pts, pts[1:]):
-            auc += (x2 - x1) * (y1 + y2) / 2.0
+        # Rank-based AUC (equivalent to Mann-Whitney U with tie handling):
+        # probability that a random positive has a higher score than a random negative.
+        pos = [ss for yy, ss in zip(y, s) if yy == 1]
+        neg = [ss for yy, ss in zip(y, s) if yy == 0]
+        if not pos or not neg:
+            auc = 0.0
+        else:
+            wins = 0.0
+            for p in pos:
+                for n in neg:
+                    if p > n:
+                        wins += 1.0
+                    elif p == n:
+                        wins += 0.5
+            auc = wins / (len(pos) * len(neg))
+
         # Per-round episode TTD:
         # - starts at 0 on attack start round,
         # - increases while attack episode has no flag,
@@ -743,10 +746,10 @@ class DMMCoordinator:
             same = random.sample(active_clients, k=min(CLIENTS_PER_MODEL, len(active_clients)))
             mapping = {i: same for i in range(Nm)}
 
-        
-        # any attacker this round?
-        attack_any = False
-        
+
+        # attacked update count this round (used to derive y_true label)
+        attack_updates_count = 0
+
 
         # request updates
         for i in range(Nm):
@@ -758,7 +761,7 @@ class DMMCoordinator:
                 is_malicious_client = bool(ce.get("malicious", False))
                 use_mal = is_malicious_client and (random.random() < exp.p_attack)
                 if use_mal:
-                    attack_any = True
+                    attack_updates_count += 1
 
                 state_b64 = state_dict_to_b64(self.get_state(i))
                 payload = {
@@ -796,7 +799,7 @@ class DMMCoordinator:
                 continue
             if len(model_updates[i]) == 0:
                 continue
-            agg_method = "trimmed_mean" if exp.detector == "ROBUST" else "mean"
+            agg_method = "trimmed_mean" if exp.detector == ("ROBUST", "MMR") else "mean"
             agg_delta = self.aggregate_and_apply(model_updates[i], method=agg_method)
 
             # apply to server-side model i
@@ -859,14 +862,20 @@ class DMMCoordinator:
         elif exp.detector == "MMR":
             D = self.compute_pairwise_distances()
             probe_losses = self.compute_probe_losses()
-            # take a scalar score = max pairwise distance OR probe variance, whichever higher (signal)
+            # Scalar score for AUC: normalize by round/baseline context to reduce raw drift over time.
             tri = []
             for a in range(Nm):
                 for b in range(a + 1, Nm):
                     tri.append(D[a][b])
             max_pair = max(tri) if tri else 0.0
+            med_pair = statistics.median(tri) if tri else 0.0
+            mad_pair = statistics.median([abs(x - med_pair) for x in tri]) if tri else 0.0
+            pair_z = (max_pair - med_pair) / (mad_pair + 1e-6)
+
             varp = statistics.pvariance(probe_losses) if len(probe_losses) > 1 else 0.0
-            score = float(max(max_pair, varp))
+            probe_base = self.probe_variance_baseline if self.probe_variance_baseline is not None else max(varp, 1e-6)
+            probe_ratio = varp / (probe_base + 1e-6)
+            score = float(max(pair_z, probe_ratio))
 
             flags = self.detect_anomalies(D, probe_losses, alpha=ALPHA, beta=BETA)
             if flags and exp.mitigation:
@@ -898,8 +907,8 @@ class DMMCoordinator:
                         if flag:
                             flagged_clients.add(cid)
 
-                mr.round_flags[r] = list(flagged_clients)
-                print("[DEBUG] Final round_flags =", mr.round_flags)
+                mr.round_flagged_clients[r] = list(flagged_clients)
+                print("[DEBUG] Final round_flagged_clients =", mr.round_flagged_clients)
 
                 if not MMR_DIVERGENCE_MITIGATION:
                     print(f"[SERVER] Detected anomalies but mitigation disabled (flags={flags})")
@@ -922,7 +931,7 @@ class DMMCoordinator:
             r,
             score,
             flags,
-            attack_any,
+            attack_updates_count >= ATTACK_MIN_UPDATES_FOR_POSITIVE,
             round_resource_usage,
             {"round_total_sec": round_total_elapsed, "detection_sec": detection_elapsed},
         )
@@ -942,16 +951,16 @@ if __name__ == "__main__":
     # --- Start registration listener once ---
     server.start_registration_server()
 
-    EXPECTED_CLIENTS = 3
+    EXPECTED_CLIENTS = 10
     while len(server.device_registry) < EXPECTED_CLIENTS:
         print(f"[SERVER] Waiting for clients... ({len(server.device_registry)}/{EXPECTED_CLIENTS})")
         time.sleep(5)
     print(f"[SERVER] All clients registered: {list(server.device_registry.keys())}")
 
-    qs = [0.2,0.5]
-    ps = [0.2]
-    nms = [3]
-    atks = ["backdoor"]
+    qs = [0.2,0.5,1.0]
+    ps = [0.05,0.1,0.2]
+    nms = [3,5]
+    atks = ["backdoor","scaled","slow_drift"]
     seeds = [1,2,3]
 
     # Choose detector per sweep (repeat this block for each method: NONE, ROBUST, FLANDERS, MMR)
@@ -961,7 +970,7 @@ if __name__ == "__main__":
         os.remove(all_results_csv)
 
 
-    for DET in ["MMR","FLANDERS","ROBUST", "NONE"]:
+    for DET in ["MMR", "ROBUST", "FLANDERS", "NONE"]:
         for q in qs:
             for p in ps:
                 for Nm in nms:
